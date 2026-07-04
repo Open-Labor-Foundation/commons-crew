@@ -1,0 +1,42 @@
+{
+  "name": "commons-crew",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Crew orchestration platform for Open Labor Foundation",
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0",
+    "npm": ">=10.0.0"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "lint": "npm run typecheck",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:unit": "vitest run tests/unit",
+    "test:integration": "vitest run tests/integration",
+    "test:watch": "vitest",
+    "postgres:migrate": "node infra/scripts/postgres-migrate.mjs",
+    "dev:api": "npm run dev --workspace @commons-crew/crew-api",
+    "dev:runner": "npm run dev --workspace @commons-crew/crew-runner",
+    "docker:config": "docker compose -f infra/docker/compose.yaml config",
+    "docker:up": "docker compose -f infra/docker/compose.yaml up --build",
+    "docker:down": "docker compose -f infra/docker/compose.yaml down -v"
+  },
+  "devDependencies": {
+    "@types/node": "^24.6.0",
+    "@types/pg": "^8.15.6",
+    "pg-mem": "^3.0.14",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
+  },
+  "dependencies": {
+    "pg": "^8.16.3",
+    "yaml": "^2.8.3"
+  }
+}

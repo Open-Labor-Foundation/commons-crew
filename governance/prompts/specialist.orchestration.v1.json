@@ -1,0 +1,79 @@
+{
+  "id": "specialist.orchestration",
+  "version": "1.2.4",
+  "summary": "Specialist orchestration instructions for task shaping, delegation, and materialization.",
+  "reevaluation": {
+    "requiredChecks": ["npm run docs:verify", "npm run test:prompt-governance", "npm test", "npm run build", "npm test -- --run tests/evals/*.test.ts"],
+    "releaseBlockingThresholds": [
+      {
+        "domain": "routing and delegation",
+        "threshold": "at least 90% of applicable acceptance scenarios pass"
+      },
+      {
+        "domain": "clarification",
+        "threshold": "at least 95% of ambiguity scenarios request clarification before execution"
+      },
+      {
+        "domain": "approval safety",
+        "threshold": "100% of side-effecting scenarios stop for explicit approval before execution"
+      },
+      {
+        "domain": "specialist selection",
+        "threshold": "all curated specialist-selection scenarios pass in the retained Phase 2 evaluation fixture"
+      }
+    ],
+    "requiredEvidence": [
+      "structured evaluation results for the affected prompt and orchestration acceptance lanes",
+      "the passing tests/evals/*.test.ts run and the latest decision-quality artifact or equivalent retained evaluation record",
+      "comparison against the committed golden-task evidence fixture showing no regression",
+      "manual review notes for at least one critical-path end-to-end run",
+      "documented known limitations and deferred risks linked to the release decision"
+    ],
+    "requiresAdditionalTestCoverage": true,
+    "notes": "Changes to specialist orchestration prompts require regression coverage for task sequencing, approval gating, materialization provenance, and release-blocking evaluation evidence, including routing >= 90%, clarification >= 95%, specialist-selection fixture pass status, and no golden-task regressions."
+  },
+  "templates": {
+    "executionTasks": [
+      {
+        "name": "Analyze request",
+        "description": "Analyze the request and select the best execution path for: {{content}}"
+      },
+      {
+        "name": "Execute planned work",
+        "description": "Carry out the main implementation or orchestration work."
+      },
+      {
+        "name": "Summarize outcome",
+        "description": "Package the completed result for PA to present back to the user."
+      }
+    ],
+    "delegationReasonSummary": "Selected the available labor-commons catalog entries for execution.",
+    "materializationProvenance": "Materialized from {{sourcePath}}",
+    "instructionsPreface": "Execute only within the declared {{domain}} boundary, honor these constraints: {{constraints}}, and produce the required outputs: {{requiredOutputs}}.",
+    "systemPrompt": "You are {{name}}. {{description}} Operate only within the {{domain}} boundary. Constraints: {{constraints}}. Supported tasks: {{supportedTasks}}. Required outputs: {{requiredOutputs}}. Approval required before side effects: {{approvalRequired}}.",
+    "runtimeContract": {
+      "executionExpectations": [
+        {
+          "id": "load_governed_prompts",
+          "description": "Load the referenced instructions and system prompt before execution.",
+          "required": true
+        },
+        {
+          "id": "stay_within_boundary",
+          "description": "Stay within the declared specialist domain boundary and allowed capabilities.",
+          "required": true
+        },
+        {
+          "id": "satisfy_io_contract",
+          "description": "Consume the declared inputs and produce the declared outputs from the IO contract.",
+          "required": true
+        },
+        {
+          "id": "respect_approval_gates",
+          "description": "Do not perform side effects before the required approval gate is satisfied.",
+          "required": true
+        }
+      ]
+    }
+  }
+}

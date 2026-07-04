@@ -1,0 +1,76 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U commons_crew -d commons_crew"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  crew-api:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.api
+    environment:
+      PA_CONFIG_PROFILE: trusted-host
+      NODE_ENV: production
+      PA_API_PORT: 4000
+      PA_RUNNER_PORT: 4001
+      PA_STORAGE_MODE: postgres
+      PA_DATABASE_URL: ${PA_DATABASE_URL:?set PA_DATABASE_URL in .env}
+      PA_DATABASE_SCHEMA: pa_runtime
+      OLF_AGENTS_ROOT: /opt/labor-commons
+      PA_PROVIDER_BASE_URL: ${PA_PROVIDER_BASE_URL:-https://api.featherless.ai/v1}
+      PA_PROVIDER_MODEL: ${PA_PROVIDER_MODEL:-Qwen/Qwen3-32B}
+      PA_PROVIDER_API_KEY: ${PA_PROVIDER_API_KEY:?set PA_PROVIDER_API_KEY in .env}
+      PA_API_TOKEN: ${PA_API_TOKEN:?set PA_API_TOKEN in .env}
+    ports:
+      - "4000:4000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:4000/health >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    volumes:
+      - ../../:/app
+      - ${LABOR_COMMONS_HOST_PATH:?set LABOR_COMMONS_HOST_PATH in .env}:/opt/labor-commons:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  crew-runner:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile.runner
+    environment:
+      PA_CONFIG_PROFILE: trusted-host
+      NODE_ENV: production
+      PA_RUNNER_PORT: 4001
+      PA_STORAGE_MODE: postgres
+      PA_DATABASE_URL: ${PA_DATABASE_URL:?set PA_DATABASE_URL in .env}
+      PA_DATABASE_SCHEMA: pa_runtime
+      OLF_AGENTS_ROOT: /opt/labor-commons
+      PA_PROVIDER_BASE_URL: ${PA_PROVIDER_BASE_URL:-https://api.featherless.ai/v1}
+      PA_PROVIDER_MODEL: ${PA_PROVIDER_MODEL:-Qwen/Qwen3-32B}
+      PA_PROVIDER_API_KEY: ${PA_PROVIDER_API_KEY:?set PA_PROVIDER_API_KEY in .env}
+    ports:
+      - "4001:4001"
+    volumes:
+      - ../../:/app
+      - ${LABOR_COMMONS_HOST_PATH:?set LABOR_COMMONS_HOST_PATH in .env}:/opt/labor-commons:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      crew-api:
+        condition: service_healthy
+
+volumes:
+  postgres_data:

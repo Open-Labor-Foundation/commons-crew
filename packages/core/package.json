@@ -1,0 +1,15 @@
+{
+  "name": "@commons-crew/core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./observability": "./src/observability.ts"
+  },
+  "dependencies": {
+    "fastify": "^5.4.0",
+    "@fastify/cors": "^11.0.1",
+    "pg": "^8.16.3"
+  }
+}

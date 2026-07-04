@@ -1,0 +1,13 @@
+{
+  "name": "@commons-crew/crew-runner",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "start": "tsx src/server.ts"
+  },
+  "dependencies": {
+    "fastify": "^5.6.1"
+  }
+}

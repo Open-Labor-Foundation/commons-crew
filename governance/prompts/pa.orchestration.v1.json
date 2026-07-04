@@ -1,0 +1,60 @@
+{
+  "id": "pa.orchestration",
+  "version": "1.1.0",
+  "summary": "Primary PA orchestration instructions and user-facing control messages.",
+  "reevaluation": {
+    "requiredChecks": ["npm run docs:verify", "npm run test:prompt-governance", "npm test", "npm run build", "npm test -- --run tests/evals/*.test.ts"],
+    "releaseBlockingThresholds": [
+      {
+        "domain": "routing and delegation",
+        "threshold": "at least 90% of applicable acceptance scenarios pass"
+      },
+      {
+        "domain": "clarification",
+        "threshold": "at least 95% of ambiguity scenarios request clarification before execution"
+      },
+      {
+        "domain": "approval safety",
+        "threshold": "100% of side-effecting scenarios stop for explicit approval before execution"
+      },
+      {
+        "domain": "specialist selection",
+        "threshold": "all curated specialist-selection scenarios pass in the retained Phase 2 evaluation fixture"
+      }
+    ],
+    "requiredEvidence": [
+      "structured evaluation results for the affected prompt and orchestration acceptance lanes",
+      "the passing tests/evals/*.test.ts run and the latest decision-quality artifact or equivalent retained evaluation record",
+      "comparison against the committed golden-task evidence fixture showing no regression",
+      "manual review notes for at least one critical-path end-to-end run",
+      "documented known limitations and deferred risks linked to the release decision"
+    ],
+    "requiresAdditionalTestCoverage": true,
+    "notes": "Changes to PA orchestration prompts require regression coverage for plan creation, run creation, diagnostics, and release-blocking evaluation evidence, including routing >= 90%, clarification >= 95%, specialist-selection fixture pass status, and no golden-task regressions."
+  },
+  "templates": {
+    "modeSummaries": {
+      "planning": "planning requested",
+      "execution": "execution requested",
+      "chat": "direct chat"
+    },
+    "planningSteps": [
+      {
+        "title": "Clarify the objective",
+        "description": "Clarify success criteria and intended outcome for: {{content}}"
+      },
+      {
+        "title": "Map the work",
+        "description": "Break the request into explicit execution-ready steps."
+      },
+      {
+        "title": "Prepare execution",
+        "description": "Lock the plan so PA can execute against it without silent drift."
+      }
+    ],
+    "planningAcknowledgement": "PA drafted plan {{planId}}. Review it and lock it when you are ready to execute.",
+    "executionAcknowledgement": "PA started run {{runId}}. You can inspect tasks, events, and approvals while execution proceeds.",
+    "chatAcknowledgement": "PA received: \"{{content}}\". The {{modeSummary}} flow is active, and the platform can now create plans, runs, approvals, and event streams when needed.",
+    "runSummary": "Execution run for request: {{content}}"
+  }
+}
