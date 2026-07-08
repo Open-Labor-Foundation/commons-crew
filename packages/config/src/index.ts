@@ -13,6 +13,7 @@ export const ALLOWED_ENV_OVERRIDES = [
   "PA_DATABASE_URL",
   "PA_DATABASE_SCHEMA",
   "OLF_AGENTS_ROOT",
+  "PA_WORKSPACE_ROOT",
   "PA_ARTIFACTS_ROOT",
   "PA_STATE_FILE",
   "PA_BACKUPS_ROOT",
@@ -50,6 +51,11 @@ export type AppConfig = {
   };
   paths: {
     repoRoot: string;
+    // The workspace the runtime ACTS on (reads/writes/runs commands). Defaults to
+    // repoRoot (as in the container, which acts on itself), but surfaces that embed
+    // the runtime — VS Code, mobile — point this at the user's project folder while
+    // repoRoot stays the bundled app/governance root.
+    workspaceRoot: string;
     olfAgentsRoot: string;
     artifactsRoot: string;
     stateFile: string;
@@ -309,6 +315,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     },
     paths: {
       repoRoot,
+      workspaceRoot: env.PA_WORKSPACE_ROOT ?? repoRoot,
       olfAgentsRoot: env.OLF_AGENTS_ROOT ?? defaults.paths.olfAgentsRoot,
       artifactsRoot: env.PA_ARTIFACTS_ROOT ?? defaults.paths.artifactsRoot,
       stateFile: env.PA_STATE_FILE ?? defaults.paths.stateFile,

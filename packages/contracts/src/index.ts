@@ -1223,6 +1223,10 @@ export type ActionProposalRecord = {
   actionClass: "class_a" | "class_b" | "class_c";
   actionSummary: string;
   targetRef: string;
+  // Tool arguments beyond the target (e.g. file content for write_file, the
+  // command for run_command, old/new for edit_file). Null for tools that only
+  // need targetRef (read_file, inspect_workspace).
+  toolPayload: Record<string, unknown> | null;
   readOnly: boolean;
   supportsDryRun: boolean;
   supportsPreflight: boolean;
@@ -1700,12 +1704,45 @@ export type ProviderStatus = {
   diagnostics: ProviderDiagnostics;
 };
 
+// A single step of a governed tool-using agent loop: given the specialist's
+// system prompt + conversation so far + the tools it may use, return either the
+// next tool calls to run or a final text answer. The RUNTIME owns the loop and
+// the governance (each tool call becomes an action proposal, class_c is
+// approval-gated); the provider only decides the next step.
+export type ProviderToolDefinition = {
+  name: string;
+  description: string;
+  parameters: unknown;
+};
+export type ProviderToolCall = {
+  id: string;
+  name: string;
+  arguments: string;
+};
+export type ProviderToolLoopMessage = {
+  role: "user" | "assistant" | "tool";
+  content: string | null;
+  toolCallId?: string;
+  toolName?: string;
+  toolCalls?: ProviderToolCall[];
+};
+export type ToolStepInput = {
+  systemPrompt: string;
+  messages: ProviderToolLoopMessage[];
+  tools: ProviderToolDefinition[];
+};
+export type ToolStepResult = {
+  content: string | null;
+  toolCalls: ProviderToolCall[];
+};
+
 export type ProviderAdapter = {
   getStatus: () => Promise<ProviderStatus>;
   decideIntake: (input: IntakeDecisionInput) => Promise<IntakeDecision>;
   answerChat: (input: ChatAnswerInput) => Promise<ChatAnswer>;
   createPlan: (input: PlanDraftInput) => Promise<PlanDraft>;
   executeTask: (input: TaskExecutionInput) => Promise<TaskExecutionResult>;
+  proposeToolCalls: (input: ToolStepInput) => Promise<ToolStepResult>;
   synthesizeRunResult: (input: RunResultSynthesisInput) => Promise<RunResultSynthesisResult>;
 };
 

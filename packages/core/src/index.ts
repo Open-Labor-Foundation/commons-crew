@@ -76,6 +76,11 @@ import {
   TaskRecord,
   TaskExecutionInput,
   TaskExecutionResult,
+  ToolStepInput,
+  ToolStepResult,
+  ProviderToolCall,
+  ProviderToolDefinition,
+  ProviderToolLoopMessage,
   UserRecord,
   WorkItemCollaborationMessageRecord,
   WorkItemCollaborationThreadRecord,
@@ -280,6 +285,17 @@ const ACTION_TOOL_POLICIES: Record<string, ActionPolicyContract> = {
   idempotencyScope: "run_task",
   requiredPermissions: ["external_system_mutation"],
   evidenceShape: "external_change_log"
+  },
+  run_command: {
+    actionClass: "class_c",
+  readOnly: false,
+  supportsDryRun: false,
+  supportsPreflight: false,
+  supportsRollback: false,
+  requiresApproval: true,
+  idempotencyScope: "run_task",
+  requiredPermissions: ["command_execution"],
+  evidenceShape: "command_output"
   }
 };
 
@@ -1404,6 +1420,11 @@ function createEvaluationProvider(config: AppConfig) {
 
     async executeTask(input: TaskExecutionInput): Promise<TaskExecutionResult> {
       return createEvaluationTaskExecutionResult(input);
+    },
+
+    async proposeToolCalls(): Promise<ToolStepResult> {
+      // Evaluation provider is deterministic and never proposes tool calls.
+      return { content: "evaluation provider: no tool calls", toolCalls: [] };
     },
 
     async synthesizeRunResult(input: RunResultSynthesisInput): Promise<RunResultSynthesisResult> {
@@ -3012,6 +3033,267 @@ export async function createAppServices(
     }, activeTask?.id ?? null);
   }
 
+  function buildGovernedToolDefinitions(allowSideEffects: boolean): ProviderToolDefinition[] {
+    const defs: ProviderToolDefinition[] = [
+      {
+        name: "inspect_workspace",
+        description: "List the entries in a workspace directory. Pass path 'workspace' for the root, or a relative subdirectory path.",
+        parameters: {
+          type: "object",
+          properties: { path: { type: "string", description: "Relative directory path, or 'workspace' for the root." } },
+          required: []
+        }
+      },
+      {
+        name: "read_file",
+        description: "Read a UTF-8 text file from the workspace and return its contents.",
+        parameters: {
+          type: "object",
+          properties: { path: { type: "string", description: "Relative file path." } },
+          required: ["path"]
+        }
+      },
+      {
+        name: "write_file",
+        description: "Create or overwrite a file with the given full contents. This is a governed, recorded change.",
+        parameters: {
+          type: "object",
+          properties: {
+            path: { type: "string", description: "Relative file path." },
+            content: { type: "string", description: "The complete new file contents." }
+          },
+          required: ["path", "content"]
+        }
+      },
+      {
+        name: "edit_file",
+        description: "Replace the first exact occurrence of `old` with `new` in an existing file. This is a governed, recorded change.",
+        parameters: {
+          type: "object",
+          properties: {
+            path: { type: "string", description: "Relative file path." },
+            old: { type: "string", description: "Exact text to find (first occurrence)." },
+            new: { type: "string", description: "Replacement text." }
+          },
+          required: ["path", "old", "new"]
+        }
+      }
+    ];
+    if (allowSideEffects) {
+      defs.push({
+        name: "run_command",
+        description: "Run a shell command in the workspace and return its combined stdout/stderr. Use for builds, tests, installs, and other executions. This is an approval-gated side effect.",
+        parameters: {
+          type: "object",
+          properties: { command: { type: "string", description: "The shell command to run." } },
+          required: ["command"]
+        }
+      });
+    }
+    return defs;
+  }
+
+  function safeParseToolArgs(raw: string): Record<string, unknown> {
+    try {
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
+    } catch {
+      return {};
+    }
+  }
+
+  async function readActionExecutionEvidence(actionId: string): Promise<{ outcome?: string; payload?: unknown } | null> {
+    try {
+      const location = actionEvidenceLocation(actionId, "execution-evidence.json");
+      const raw = await fs.readFile(location, "utf8");
+      const parsed = JSON.parse(raw) as { execution?: { outcome?: string; payload?: unknown } };
+      return parsed.execution ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  // Mint an already-approved approval bound to this run/task/tool/target so a
+  // class_c tool call can execute. Only ever called when the task itself is
+  // approved for side effects (i.e. a human already cleared this task via the
+  // task-level approval gate), so each governed action stays individually
+  // evidenced without a fresh human round-trip mid-loop.
+  async function mintApprovedApproval(run: RunRecord, task: TaskRecord, toolId: string, targetRef: string): Promise<void> {
+    const timestamp = now();
+    const approval: ApprovalRecord = {
+      id: randomUUID(),
+      runId: run.id,
+      taskId: task.id,
+      workItemId: run.workItemId,
+      requestedByRuntimeId: "pa-runtime",
+      actionSummary: `${toolId} on ${targetRef}`.slice(0, 200),
+      impactScope: "real_world",
+      actionProposalId: null,
+      toolId,
+      targetRef,
+      expiresAt: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+      status: "approved",
+      decisionComment: "Task was granted side-effect approval; auto-approved for governed tool execution.",
+      requestedAt: timestamp,
+      decidedAt: timestamp
+    };
+    await store.write((current) => ({
+      ...current,
+      approvals: [approval, ...current.approvals]
+    }));
+  }
+
+  type GovernedToolCallOutcome = { ok: boolean; targetRef: string; outcome: string; payload: unknown };
+
+  async function runGovernedToolCall(
+    run: RunRecord,
+    task: TaskRecord,
+    allowSideEffects: boolean,
+    toolId: string,
+    args: Record<string, unknown>,
+    idempotencyKey: string
+  ): Promise<GovernedToolCallOutcome> {
+    const policy = getToolPolicy(toolId);
+    let targetRef: string;
+    if (toolId === "run_command") {
+      targetRef = typeof args.command === "string" ? args.command : "";
+    } else if (toolId === "inspect_workspace") {
+      targetRef = typeof args.path === "string" && args.path.trim() ? args.path : "workspace";
+    } else {
+      targetRef = typeof args.path === "string" ? args.path : "";
+    }
+
+    if (!policy) {
+      return { ok: false, targetRef, outcome: "tool_not_allowed", payload: { error: `Tool ${toolId} is not permitted by the action policy contract.` } };
+    }
+    if (!targetRef.trim()) {
+      return { ok: false, targetRef, outcome: "missing_argument", payload: { error: `Tool ${toolId} was called without its required path/command argument.` } };
+    }
+
+    if (policy.requiresApproval) {
+      if (!allowSideEffects) {
+        return {
+          ok: false,
+          targetRef,
+          outcome: "approval_required",
+          payload: { error: `${toolId} is a side effect that requires approval, which this task has not been granted. Complete the task without it.` }
+        };
+      }
+      await mintApprovedApproval(run, task, toolId, targetRef);
+    }
+
+    const proposal = await actions.createProposal({
+      workItemId: run.workItemId,
+      runId: run.id,
+      taskId: task.id,
+      toolId,
+      actionClass: policy.actionClass,
+      targetRef,
+      actionSummary: `${toolId} on ${targetRef}`.slice(0, 200),
+      idempotencyKey,
+      toolPayload: args
+    });
+    if ("error" in proposal) {
+      return { ok: false, targetRef, outcome: "proposal_rejected", payload: { error: proposal.error.message } };
+    }
+
+    const execResult = await actions.execute(proposal.id);
+    if (!execResult || "error" in execResult) {
+      const message = execResult && "error" in execResult ? execResult.error.message : "Action execution failed.";
+      return { ok: false, targetRef, outcome: "execution_failed", payload: { error: message } };
+    }
+
+    const evidence = await readActionExecutionEvidence(proposal.id);
+    const outcome = typeof evidence?.outcome === "string" ? evidence.outcome : "completed";
+    const ok = !outcome.includes("failed");
+    return { ok, targetRef, outcome, payload: evidence?.payload ?? {} };
+  }
+
+  // The governed tool loop: task execution that actually ACTS. A materialized
+  // specialist reads/writes/runs in the real workspace by proposing tool calls;
+  // the runtime executes each one through its governed action machinery
+  // (proposal -> policy check -> approval gate -> executor -> evidence) and feeds
+  // the result back until the specialist stops calling tools and returns its
+  // final summary. class_a/class_b tools run autonomously; class_c (run_command)
+  // is only offered when the task is approved for side effects.
+  async function executeTaskWithGovernedTools(
+    input: TaskExecutionInput,
+    run: RunRecord,
+    task: TaskRecord
+  ): Promise<TaskExecutionResult> {
+    const allowSideEffects = input.task.approvedForSideEffects;
+    const tools = buildGovernedToolDefinitions(allowSideEffects);
+
+    const specialistPrompt = input.materializedSpecialist?.systemPrompt?.trim() || "You are a governed commons-crew specialist.";
+    const specialistInstructions = input.materializedSpecialist?.instructions?.trim() ?? "";
+    const systemPrompt = [
+      specialistPrompt,
+      specialistInstructions,
+      "You are executing a single task by USING TOOLS to act on a real workspace — not by describing what should be done.",
+      "Inspect and read what you need, then make the actual changes with write_file / edit_file, and (when available) run_command.",
+      allowSideEffects
+        ? "run_command is available for this task; use it for builds, tests, and other executions."
+        : "run_command is NOT available for this task. Do all work with file reads/writes and do not rely on executing commands.",
+      "Every tool call is governed and recorded as evidence. Make real, minimal, correct changes.",
+      "When the task is fully complete, reply with a final plain-text message (and NO tool calls) that summarizes exactly what you changed."
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+
+    const priorText = input.priorCompletedTasks.length
+      ? `Prior completed tasks in this run:\n${input.priorCompletedTasks.map((entry) => `- ${entry.name}: ${entry.summary}`).join("\n")}`
+      : "No prior tasks have completed in this run yet.";
+    const userContent = [
+      `Run objective: ${input.run.summary}`,
+      `Your task: ${input.task.name}`,
+      input.task.description ? `Task details: ${input.task.description}` : "",
+      priorText,
+      "The workspace root is the current directory; use relative paths."
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+
+    const messages: ProviderToolLoopMessage[] = [{ role: "user", content: userContent }];
+    const actionsTaken: string[] = [];
+    let finalText: string | null = null;
+    const maxSteps = 24;
+
+    for (let step = 0; step < maxSteps; step++) {
+      const response = await provider.proposeToolCalls({ systemPrompt, messages, tools });
+      if (!response.toolCalls.length) {
+        finalText = response.content;
+        break;
+      }
+
+      messages.push({ role: "assistant", content: response.content, toolCalls: response.toolCalls });
+
+      for (const call of response.toolCalls) {
+        const args = safeParseToolArgs(call.arguments);
+        const idempotencyKey = `${task.id}:${step}:${call.id}`;
+        const result = await runGovernedToolCall(run, task, allowSideEffects, call.name, args, idempotencyKey);
+        actionsTaken.push(`${call.name} ${result.targetRef} -> ${result.outcome}`);
+        messages.push({
+          role: "tool",
+          toolCallId: call.id,
+          toolName: call.name,
+          content: JSON.stringify({ ok: result.ok, outcome: result.outcome, ...(result.payload as Record<string, unknown>) }).slice(0, 8000)
+        });
+        await appendEvent(
+          run.id,
+          "task.tool_call",
+          { taskId: task.id, tool: call.name, targetRef: result.targetRef, outcome: result.outcome, ok: result.ok },
+          task.id
+        );
+      }
+    }
+
+    const summary =
+      finalText?.trim() ||
+      (actionsTaken.length ? `Completed the task via ${actionsTaken.length} governed tool action(s).` : "Task completed with no changes required.");
+    const detail = actionsTaken.length ? actionsTaken.join("\n") : finalText?.trim() ? null : "No tools were used.";
+    return { summary, detail };
+  }
+
   async function executeRun(runId: string, jobId: string) {
     if (shuttingDown) {
       return;
@@ -3230,7 +3512,7 @@ export async function createAppServices(
           ? await executeTaskInWorkerContainer(config, taskExecutionInput)
           : specialistExecutionMode === "isolated_subprocess"
             ? await executeTaskInSubprocess(config, taskExecutionInput)
-            : await provider.executeTask(taskExecutionInput);
+            : await executeTaskWithGovernedTools(taskExecutionInput, run, nextTask);
       if (shuttingDown) {
         return;
       }
@@ -5603,6 +5885,7 @@ export async function createAppServices(
       targetRef: string;
       actionSummary?: string;
       idempotencyKey: string;
+      toolPayload?: Record<string, unknown> | null;
     }): Promise<ActionProposalRecord | ActionPolicyError> {
       const toolPolicy = getToolPolicy(input.toolId);
       if (!toolPolicy) {
@@ -5795,6 +6078,7 @@ export async function createAppServices(
         actionClass: input.actionClass,
         actionSummary: input.actionSummary ?? `${input.actionClass} ${input.toolId} on ${input.targetRef}`,
         targetRef: input.targetRef,
+        toolPayload: input.toolPayload ?? null,
         readOnly: toolPolicy.readOnly,
         supportsDryRun: toolPolicy.supportsDryRun,
         supportsPreflight: toolPolicy.supportsPreflight,

@@ -15,7 +15,9 @@ import type {
   RunResultSynthesisInput,
   RunResultSynthesisResult,
   TaskExecutionInput,
-  TaskExecutionResult
+  TaskExecutionResult,
+  ToolStepInput,
+  ToolStepResult
 } from "../../contracts/src/index";
 import type { AppConfig } from "../../config/src/index";
 
@@ -355,12 +357,71 @@ export function createApiProvider(config: AppConfig): ProviderAdapter {
     );
   }
 
+  // One step of the runtime-owned tool loop: a raw chat-completions call with
+  // tools. Returns the model's next tool calls or its final text. The runtime
+  // executes any tool calls through its governed action machinery and calls back
+  // in for the next step.
+  async function proposeToolCalls(input: ToolStepInput): Promise<ToolStepResult> {
+    const key = requireApiKey();
+    const messages = [
+      { role: "system", content: input.systemPrompt },
+      ...input.messages.map((m) => {
+        const base: Record<string, unknown> = { role: m.role, content: m.content ?? "" };
+        if (m.role === "tool") {
+          base.tool_call_id = m.toolCallId;
+        }
+        if (m.role === "assistant" && m.toolCalls?.length) {
+          base.tool_calls = m.toolCalls.map((tc) => ({
+            id: tc.id,
+            type: "function",
+            function: { name: tc.name, arguments: tc.arguments }
+          }));
+        }
+        return base;
+      })
+    ];
+    const tools = input.tools.map((t) => ({
+      type: "function",
+      function: { name: t.name, description: t.description, parameters: t.parameters }
+    }));
+
+    const url = `${baseUrl.replace(/\/$/, "")}/chat/completions`;
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${key}`,
+        "Content-Type": "application/json",
+        Accept: "application/json"
+      },
+      body: JSON.stringify({ model, messages, tools: tools.length ? tools : undefined, temperature: 0, max_tokens: 4096 })
+    });
+    if (!response.ok) {
+      const text = await response.text().catch(() => "(unreadable)");
+      throw new Error(`Provider API error ${response.status}: ${text}`);
+    }
+    const json = (await response.json()) as {
+      choices?: Array<{ message?: { content?: string | null; tool_calls?: Array<{ id: string; function: { name: string; arguments: string } }> } }>;
+      error?: { message?: string };
+    };
+    if (json.error?.message) {
+      throw new Error(`Provider API error: ${json.error.message}`);
+    }
+    const message = json.choices?.[0]?.message ?? {};
+    return {
+      content: typeof message.content === "string" ? message.content : null,
+      toolCalls: Array.isArray(message.tool_calls)
+        ? message.tool_calls.map((tc) => ({ id: tc.id, name: tc.function.name, arguments: tc.function.arguments }))
+        : []
+    };
+  }
+
   return {
     getStatus,
     decideIntake,
     answerChat,
     createPlan,
     executeTask,
+    proposeToolCalls,
     synthesizeRunResult
   };
 }

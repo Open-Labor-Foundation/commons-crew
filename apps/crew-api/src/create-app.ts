@@ -23,6 +23,7 @@ import {
   type RunResultSynthesisResult,
   type TaskExecutionInput,
   type TaskExecutionResult,
+  type ToolStepResult,
   serializeRunEventSse,
   toRunEventContract
 } from "../../../packages/contracts/src/index";
@@ -226,6 +227,10 @@ function createTestProvider(config: AppConfig): ApiProvider {
     },
     async executeTask(input: TaskExecutionInput): Promise<TaskExecutionResult> {
       return createTestTaskExecutionResult(input);
+    },
+    async proposeToolCalls(): Promise<ToolStepResult> {
+      // The test provider never proposes tool calls — it finishes immediately.
+      return { content: "test provider: no tool calls", toolCalls: [] };
     },
     async synthesizeRunResult(input: RunResultSynthesisInput): Promise<RunResultSynthesisResult> {
       return createTestRunResultSynthesis(input);
