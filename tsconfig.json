@@ -19,5 +19,10 @@
     "packages/**/*.ts",
     "infra/scripts/**/*.ts",
     "tests/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "**/node_modules",
+    "apps/crew-vscode"
   ]
 }
