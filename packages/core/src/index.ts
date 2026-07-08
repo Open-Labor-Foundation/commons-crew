@@ -406,7 +406,11 @@ function checkMaterializationManifestContract(manifest: SpecialistManifestContra
     failures.push("permissions.approvalRequired must be true");
   }
 
-  if (!hasRequiredStartupHook(manifest.startupChecks, { id: "provider-api-auth", kind: "provider_auth", target: "api" })) {
+  // Must match the catalog parser's DEFAULT_STARTUP_CHECKS (packages/catalog/src/index.ts)
+  // exactly -- this check previously required id "provider-api-auth"/target "api", which
+  // no manifest the parser ever produces has, so materialization failed for every
+  // specialist unconditionally the one time this was actually run against real data.
+  if (!hasRequiredStartupHook(manifest.startupChecks, { id: "provider-commons-crew-auth", kind: "provider_auth", target: "commons-crew" })) {
     failures.push("missing required startup hook for provider auth");
   }
 
