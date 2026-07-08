@@ -13,8 +13,10 @@ export async function runAgentLoop(params: {
   ctx: ToolContext;
   maxIterations: number;
   token: vscode.CancellationToken;
-}): Promise<void> {
-  const { config, systemPrompt, task, ctx, maxIterations, token } = params;
+  progressLabel?: string;
+}): Promise<string> {
+  const { config, systemPrompt, task, ctx, maxIterations, token, progressLabel } = params;
+  const label = progressLabel ?? "";
   const messages: ChatMessage[] = [
     { role: "system", content: systemPrompt },
     { role: "user", content: task }
@@ -23,24 +25,23 @@ export async function runAgentLoop(params: {
   for (let i = 0; i < maxIterations; i += 1) {
     if (token.isCancellationRequested) {
       ctx.stream.markdown("\n\n_Cancelled._");
-      return;
+      return "(cancelled)";
     }
-    ctx.stream.progress(`Working (step ${i + 1}/${maxIterations})…`);
+    ctx.stream.progress(`${label}working (step ${i + 1}/${maxIterations})…`);
 
     let result;
     try {
       result = await chat(config, messages, toolDefs);
     } catch (err: any) {
       ctx.stream.markdown(`\n\n❌ ${err?.message ?? String(err)}`);
-      return;
+      return `(failed: ${err?.message ?? String(err)})`;
     }
 
-    // No tool calls → the specialist is done and this is its final answer.
+    // No tool calls → the specialist is done and this is its final answer/summary.
     if (!result.toolCalls.length) {
-      if (result.content) {
-        ctx.stream.markdown(`\n\n${result.content}`);
-      }
-      return;
+      const summary = result.content ?? "(no summary)";
+      ctx.stream.markdown(`\n\n${summary}`);
+      return summary;
     }
 
     // Record the assistant's tool-call turn, then execute each call and feed the
@@ -48,12 +49,13 @@ export async function runAgentLoop(params: {
     messages.push({ role: "assistant", content: result.content, tool_calls: result.toolCalls });
     for (const call of result.toolCalls) {
       if (token.isCancellationRequested) {
-        return;
+        return "(cancelled)";
       }
       const output = await executeTool(call, ctx);
       messages.push({ role: "tool", tool_call_id: call.id, name: call.function.name, content: output });
     }
   }
 
-  ctx.stream.markdown(`\n\n_Reached the ${maxIterations}-step limit. Ask me to continue if it isn't finished (raise commonsCrew.maxIterations for longer tasks)._`);
+  ctx.stream.markdown(`\n\n_Reached the ${maxIterations}-step limit for this specialist._`);
+  return "(reached step limit before finishing)";
 }
