@@ -88,6 +88,14 @@ async function gate(ctx: ToolContext, actionClass: ActionClass, summary: string)
 
 function runShell(command: string, cwd: string): Promise<string> {
   return new Promise((resolve) => {
+    // Intentional: an autonomous coding agent must run model-proposed shell
+    // commands (tests, builds, linters), so the command string is by design
+    // model-controlled. This is exactly what CodeQL flags as command injection.
+    // The control is not preventing execution — it's the mandatory approval gate
+    // in run_command above: every command is shown to the user for explicit
+    // Approve/Reject before it reaches here (unless the user opts into
+    // commonsCrew.autoApprove). Same posture as every coding agent.
+    // codeql[js/command-line-injection]
     exec(command, { cwd, timeout: 120_000, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
       const out = `${stdout ?? ""}${stderr ?? ""}`.trim();
       if (err && !out) {
