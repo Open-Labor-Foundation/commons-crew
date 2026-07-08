@@ -283,7 +283,7 @@ function createTestProvider(config: AppConfig): ApiProvider {
 
 export async function createApiApp(
   config: AppConfig = loadConfigOrThrow(),
-  options: { provider?: ApiProvider } = {}
+  options: { provider?: ApiProvider; onBeforeCatalogSync?: () => Promise<void> } = {}
 ) {
   const app = Fastify({ logger: true });
   const provider = options.provider ?? (config.profile.name === "test" ? createTestProvider(config) : undefined);
@@ -601,6 +601,11 @@ export async function createApiApp(
     if (error) {
       reply.code(403);
       return error;
+    }
+    // Re-pull the catalog from labor-commons main before re-reading it, so the
+    // live link stays current without a restart (no-op when not auto-managed).
+    if (options.onBeforeCatalogSync) {
+      await options.onBeforeCatalogSync();
     }
     return await services.catalog.sync();
   });

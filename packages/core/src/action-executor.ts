@@ -1,5 +1,4 @@
-import { promises as fs } from "node:fs";
-import path from "node:path";
+import { fs, path } from "./host";
 import type { ActionProposalRecord } from "../../contracts/src/index";
 import type { AppConfig } from "../../config/src/index";
 
