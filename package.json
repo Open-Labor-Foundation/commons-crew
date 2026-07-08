@@ -9,7 +9,8 @@
     "npm": ">=10.0.0"
   },
   "workspaces": [
-    "apps/*",
+    "apps/crew-api",
+    "apps/crew-runner",
     "packages/*"
   ],
   "scripts": {

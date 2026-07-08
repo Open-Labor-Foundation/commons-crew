@@ -1,0 +1,84 @@
+{
+  "name": "commons-crew-vscode",
+  "displayName": "commons-crew",
+  "description": "Autonomous coding with governed specialists materialized from the labor-commons catalog.",
+  "version": "0.1.0",
+  "publisher": "open-labor-foundation",
+  "private": true,
+  "license": "AGPL-3.0-or-later",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "AI",
+    "Chat",
+    "Programming Languages"
+  ],
+  "activationEvents": [],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "chatParticipants": [
+      {
+        "id": "commons-crew.chat",
+        "name": "commons-crew",
+        "fullName": "commons-crew",
+        "description": "Materializes a governed software specialist from labor-commons and works the task autonomously in your workspace.",
+        "isSticky": true
+      }
+    ],
+    "configuration": {
+      "title": "commons-crew",
+      "properties": {
+        "commonsCrew.apiKey": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Your inference API key (BYO). Stored in settings \u2014 the runtime runs locally in the extension and calls this endpoint directly."
+        },
+        "commonsCrew.baseUrl": {
+          "type": "string",
+          "default": "https://api.featherless.ai/v1",
+          "description": "OpenAI-compatible inference base URL."
+        },
+        "commonsCrew.model": {
+          "type": "string",
+          "default": "Qwen/Qwen3-32B",
+          "description": "Model id. Must support tool calling (e.g. Qwen3 family, Kimi-K2)."
+        },
+        "commonsCrew.catalogRef": {
+          "type": "string",
+          "default": "main",
+          "description": "labor-commons branch/ref to materialize specialists from."
+        },
+        "commonsCrew.autoApprove": {
+          "type": "boolean",
+          "default": false,
+          "description": "Auto-approve file writes and command execution. When false, each side-effecting action asks for confirmation (the governance gate)."
+        },
+        "commonsCrew.maxIterations": {
+          "type": "number",
+          "default": 40,
+          "description": "Maximum autonomous tool-loop iterations per task before stopping."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "node esbuild.js",
+    "watch": "node esbuild.js --watch",
+    "package": "vsce package --no-dependencies -o commons-crew.vsix"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.90.0",
+    "esbuild": "^0.23.0",
+    "typescript": "^5.5.0"
+  },
+  "dependencies": {
+    "yaml": "^2.4.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Open-Labor-Foundation/commons-crew.git",
+    "directory": "apps/crew-vscode"
+  }
+}
