@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import { loadCodingSpecialists, type CatalogSpecialist } from "./catalog";
-import { composeSystemPrompt, pickSpecialist } from "./specialist";
-import { runAgentLoop } from "./agent-loop";
+import { planTeam } from "./orchestrator";
+import { runSession } from "./session";
 import type { InferenceConfig } from "./inference";
 
 // Cache the materialized catalog per ref so we don't re-fetch on every message.
@@ -49,7 +49,7 @@ export function activate(context: vscode.ExtensionContext) {
       return;
     }
 
-    stream.progress("Materializing the right specialist from labor-commons…");
+    stream.progress("Assembling the team from labor-commons…");
     let specialists: CatalogSpecialist[];
     try {
       specialists = await getSpecialists(catalogRef);
@@ -62,15 +62,19 @@ export function activate(context: vscode.ExtensionContext) {
       return;
     }
 
-    const specialist = await pickSpecialist(inference, specialists, request.prompt);
+    // The orchestrator (chat agent) plans a team of governed specialists for the
+    // task; the session runs them under one shared session.
+    const plan = await planTeam(inference, specialists, request.prompt);
+    const specialistsBySlug = new Map(specialists.map((s) => [s.slug, s]));
     stream.markdown(
-      `**${specialist.manifest.identity.name}** materialized (\`${specialist.slug}\` from labor-commons@${catalogRef}). Working autonomously${autoApprove ? "" : " — I'll ask before writing files or running commands"}…\n`
+      `Materialized ${plan.steps.length} specialist${plan.steps.length === 1 ? "" : "s"} from labor-commons@${catalogRef}. Working autonomously${autoApprove ? "" : " — I'll ask before each file write or command"}.\n`
     );
 
-    await runAgentLoop({
+    await runSession({
       config: inference,
-      systemPrompt: composeSystemPrompt(specialist),
-      task: request.prompt,
+      plan,
+      specialistsBySlug,
+      overallGoal: request.prompt,
       ctx: { workspaceRoot: folder.uri.fsPath, autoApprove, stream },
       maxIterations,
       token
