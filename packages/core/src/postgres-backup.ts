@@ -1,5 +1,4 @@
-import { promises as fs } from "node:fs";
-import path from "node:path";
+import { fs, path } from "./host";
 import type { AppConfig } from "../../config/src/index";
 import type { PersistentState } from "../../contracts/src/index";
 import { createSqlPool, ensureIdentifier, quoteIdentifier, type SqlPool } from "./postgres-store";

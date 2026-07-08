@@ -1,4 +1,4 @@
-import type { IncomingHttpHeaders } from "node:http";
+import type { HttpHeaders } from "./host";
 import type {
   DegradedRunDiagnostic,
   DiagnosticsSnapshot,
@@ -65,7 +65,7 @@ export type StructuredLogger = {
   error?(payload: Record<string, unknown>, message?: string): void;
 };
 
-function getHeaderValue(headers: IncomingHttpHeaders, name: string) {
+function getHeaderValue(headers: HttpHeaders, name: string) {
   const value = headers[name];
   if (Array.isArray(value)) {
     return value[0] ?? null;
@@ -73,7 +73,7 @@ function getHeaderValue(headers: IncomingHttpHeaders, name: string) {
   return value ?? null;
 }
 
-export function readCorrelationHeaders(headers: IncomingHttpHeaders): LogCorrelationFields {
+export function readCorrelationHeaders(headers: HttpHeaders): LogCorrelationFields {
   return {
     requestId: getHeaderValue(headers, CORRELATION_HEADER_NAMES.requestId),
     traceId: getHeaderValue(headers, CORRELATION_HEADER_NAMES.traceId),
@@ -85,7 +85,7 @@ export function readCorrelationHeaders(headers: IncomingHttpHeaders): LogCorrela
   };
 }
 
-export function resolveTraceId(headers: IncomingHttpHeaders, fallback: string) {
+export function resolveTraceId(headers: HttpHeaders, fallback: string) {
   return getHeaderValue(headers, CORRELATION_HEADER_NAMES.traceId) ?? fallback;
 }
 

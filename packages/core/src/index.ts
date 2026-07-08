@@ -1,8 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
-import { execFile } from "node:child_process";
-import { promises as fs } from "node:fs";
-import path from "node:path";
-import { promisify } from "node:util";
+import { createHash, randomUUID, fs, path, execFileAsync } from "./host";
 import {
   canTransitionRunnerJobStatus,
   type ActionCheckRecord,
@@ -171,7 +167,6 @@ type EvaluationHarnessContext = {
   cleanup: () => Promise<void>;
 };
 
-const execFileAsync = promisify(execFile);
 
 const listeners = new Map<string, Set<EventListener>>();
 const REPLAY_SAFE_RUN_STATUSES: RunRecord["status"][] = ["completed", "failed", "cancelled", "paused"];

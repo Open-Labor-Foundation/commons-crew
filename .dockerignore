@@ -1,0 +1,8 @@
+**/node_modules
+.data
+.git
+**/dist
+**/*.log
+npm-debug.log*
+.DS_Store
+infra/docker

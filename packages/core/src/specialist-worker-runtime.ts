@@ -1,11 +1,7 @@
-import { execFile } from "node:child_process";
-import { promises as fs } from "node:fs";
-import path from "node:path";
-import { promisify } from "node:util";
+import { fs, path, execFileAsync } from "./host";
 import type { AppConfig } from "../../config/src/index";
 import type { TaskExecutionInput, TaskExecutionResult } from "../../contracts/src/index";
 
-const execFileAsync = promisify(execFile);
 
 const FORWARDED_ENV_KEYS = [
   "NODE_ENV",
