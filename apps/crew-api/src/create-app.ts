@@ -232,6 +232,10 @@ function createTestProvider(config: AppConfig): ApiProvider {
       // The test provider never proposes tool calls — it finishes immediately.
       return { content: "test provider: no tool calls", toolCalls: [] };
     },
+    async selectIntakeDomains(input: { domains: string[] }): Promise<{ domains: string[] }> {
+      // Deterministic: keep every domain so downstream selection is unchanged.
+      return { domains: input.domains };
+    },
     async synthesizeRunResult(input: RunResultSynthesisInput): Promise<RunResultSynthesisResult> {
       return createTestRunResultSynthesis(input);
     },

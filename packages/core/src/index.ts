@@ -184,6 +184,14 @@ const CONTROL_REASON_EVENT_TYPES = new Set([
   "run.replay_requested"
 ]);
 const runTimers = new Map<string, NodeJS.Timeout>();
+
+// Two-stage intake routing bounds. Below MIN_CATALOG the whole catalog is cheap
+// to send, so stage 1 (domain narrowing) is skipped. Otherwise the stage-2 prompt
+// is capped at MAX_NARROWED specialists; NO_DOMAIN_SAMPLE is the tiny sample sent
+// when the router picks no domain (conversational requests).
+const INTAKE_STAGE1_MIN_CATALOG = 40;
+const INTAKE_MAX_NARROWED = 80;
+const INTAKE_NO_DOMAIN_SAMPLE = 24;
 const activeRunJobs = new Set<Promise<void>>();
 const terminalRunStatuses = new Set<RunRecord["status"]>(["completed", "failed", "cancelled"]);
 
@@ -331,12 +339,17 @@ const MATERIALIZATION_FAILURE_POLICIES: Record<
   }
 };
 
+// What the governed runtime actually requires of a provider: structured outputs
+// (intake/plan JSON) and tool calls (the governed execution loop). File IO is
+// performed by the runtime's action executor, not the provider; streaming and
+// cancellation are optional conveniences. Requiring those of the raw provider was
+// a pre-governed-loop assumption that blocked every real BYO provider.
 const requiredProviderCapabilities: Omit<ProviderCapabilities, "providerIdentity"> = {
-  supportsStreaming: true,
+  supportsStreaming: false,
   supportsStructuredOutputs: true,
   supportsToolCalls: true,
-  supportsFileIo: true,
-  supportsCancellation: true
+  supportsFileIo: false,
+  supportsCancellation: false
 };
 
 const RUNTIME_MIGRATION_KEYS = [
@@ -1425,6 +1438,11 @@ function createEvaluationProvider(config: AppConfig) {
     async proposeToolCalls(): Promise<ToolStepResult> {
       // Evaluation provider is deterministic and never proposes tool calls.
       return { content: "evaluation provider: no tool calls", toolCalls: [] };
+    },
+
+    async selectIntakeDomains(input: { domains: string[] }): Promise<{ domains: string[] }> {
+      // Deterministic: the evaluation catalog is small, so keep every domain.
+      return { domains: input.domains };
     },
 
     async synthesizeRunResult(input: RunResultSynthesisInput): Promise<RunResultSynthesisResult> {
@@ -2520,9 +2538,60 @@ export async function createAppServices(
     return activeSync;
   }
 
+  // Stage 1 of intake: narrow the catalog to the specialists worth showing the
+  // router. Below a small threshold the whole catalog is cheap to send, so we
+  // skip straight to stage 2. Otherwise we ask the provider which domain(s) are
+  // relevant and keep only those specialists (capped), so the stage-2 prompt is
+  // small no matter how large the catalog grows.
+  async function narrowCatalogByDomain(
+    entries: CatalogEntry[],
+    content: string,
+    recentMessages: ReturnType<typeof buildRecentIntakeMessages>
+  ): Promise<CatalogEntry[]> {
+    if (entries.length <= INTAKE_STAGE1_MIN_CATALOG) {
+      return entries;
+    }
+    const domains = [...new Set(entries.map((entry) => entry.manifest.identity.boundary.domain).filter(Boolean))];
+    if (domains.length <= 1) {
+      return entries.slice(0, INTAKE_MAX_NARROWED);
+    }
+
+    const canonicalByLower = new Map(domains.map((domain) => [domain.toLowerCase(), domain]));
+    let selected: string[] = [];
+    try {
+      const result = await provider.selectIntakeDomains({ message: content, recentMessages, domains });
+      selected = (result.domains ?? [])
+        .map((domain) => canonicalByLower.get(domain.trim().toLowerCase()))
+        .filter((domain): domain is string => Boolean(domain));
+    } catch {
+      selected = [];
+    }
+
+    const selectedSet = new Set(selected);
+    let filtered = selectedSet.size
+      ? entries.filter((entry) => selectedSet.has(entry.manifest.identity.boundary.domain))
+      : [];
+    if (filtered.length === 0) {
+      // No domain matched (conversational request, or the router abstained). Send
+      // a small sample so stage 2 can still classify the request; specialist
+      // routing simply won't fire.
+      filtered = entries.slice(0, INTAKE_NO_DOMAIN_SAMPLE);
+    }
+    return filtered.slice(0, INTAKE_MAX_NARROWED);
+  }
+
   async function decideIntake(session: SessionRecord, content: string) {
     const state = await store.read();
     const catalogEntries = await ensureCatalog();
+    // Two-stage routing keeps the catalog out of the prompt at scale. The full
+    // catalog is hundreds (potentially thousands) of specialists; serializing all
+    // of them into one intake prompt produces a payload the provider rejects
+    // ("model busy"/oversized). Instead:
+    //   Stage 1: show only the distinct domains and pick the relevant one(s).
+    //   Stage 2: show only the specialists inside those domains, then decide.
+    // Every specialist is still reachable, but each prompt stays small.
+    const recentMessages = buildRecentIntakeMessages(state.messages, session.id);
+    const narrowedEntries = await narrowCatalogByDomain(catalogEntries, content, recentMessages);
     const decision = await provider.decideIntake({
       session: {
         id: session.id,
@@ -2531,8 +2600,8 @@ export async function createAppServices(
         status: session.status
       },
       message: content,
-      recentMessages: buildRecentIntakeMessages(state.messages, session.id),
-      catalog: buildIntakeCatalog(catalogEntries)
+      recentMessages,
+      catalog: buildIntakeCatalog(narrowedEntries)
     });
 
     return {

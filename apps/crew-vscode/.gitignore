@@ -2,3 +2,6 @@ node_modules/
 dist/
 *.vsix
 package-lock.json
+# governance/ is copied from ../../governance at build time (packaged into the
+# vsix, never committed here).
+governance/

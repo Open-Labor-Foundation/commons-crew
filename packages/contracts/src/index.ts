@@ -1519,6 +1519,20 @@ export type IntakeSpecialistCandidate = {
   reason: string;
 };
 
+// Stage 1 of two-stage intake routing: given the request and the list of distinct
+// specialist domains, pick the domain(s) worth looking inside. This keeps the full
+// catalog out of the prompt until it has been narrowed to a handful of domains, so
+// intake stays small and fast no matter how many specialists exist.
+export type IntakeDomainSelectionInput = {
+  message: string;
+  recentMessages: IntakeMessageContext[];
+  domains: string[];
+};
+
+export type IntakeDomainSelection = {
+  domains: string[];
+};
+
 export type IntakeDecision = {
   requestType: RequestType;
   needsClarification: boolean;
@@ -1738,6 +1752,7 @@ export type ToolStepResult = {
 
 export type ProviderAdapter = {
   getStatus: () => Promise<ProviderStatus>;
+  selectIntakeDomains: (input: IntakeDomainSelectionInput) => Promise<IntakeDomainSelection>;
   decideIntake: (input: IntakeDecisionInput) => Promise<IntakeDecision>;
   answerChat: (input: ChatAnswerInput) => Promise<ChatAnswer>;
   createPlan: (input: PlanDraftInput) => Promise<PlanDraft>;

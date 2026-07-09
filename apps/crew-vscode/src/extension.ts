@@ -1,84 +1,146 @@
 import * as vscode from "vscode";
-import { loadCodingSpecialists, type CatalogSpecialist } from "./catalog";
-import { planTeam } from "./orchestrator";
-import { runSession } from "./session";
-import type { InferenceConfig } from "./inference";
+import { createEmbeddedRuntime, type EmbeddedRuntime } from "./runtime";
+import { driveRequest, type RunEvent } from "./driver";
 
-// Cache the materialized catalog per ref so we don't re-fetch on every message.
-const catalogCache = new Map<string, CatalogSpecialist[]>();
+// The VS Code surface is a thin shell over the embedded commons-crew runtime.
+// It reads settings, boots the real runtime once per workspace/key, and maps the
+// surface-agnostic driver's events/approvals onto the chat stream. All the
+// substance (materialization, the governed tool loop, real file/command actions)
+// lives in the runtime — the extension is "just a use case for commons-crew".
+
+interface RuntimeKey {
+  apiKey: string;
+  model: string;
+  baseUrl: string;
+  catalogRef: string;
+  workspaceRoot: string;
+}
+
+let cached: { key: string; runtime: EmbeddedRuntime } | null = null;
 
 function readConfig() {
   const cfg = vscode.workspace.getConfiguration("commonsCrew");
-  const inference: InferenceConfig = {
+  return {
     apiKey: cfg.get<string>("apiKey", ""),
     baseUrl: cfg.get<string>("baseUrl", "https://api.featherless.ai/v1"),
-    model: cfg.get<string>("model", "Qwen/Qwen3-32B")
-  };
-  return {
-    inference,
+    model: cfg.get<string>("model", "Qwen/Qwen3-32B"),
     catalogRef: cfg.get<string>("catalogRef", "main"),
-    autoApprove: cfg.get<boolean>("autoApprove", false),
-    maxIterations: cfg.get<number>("maxIterations", 40)
+    autoApprove: cfg.get<boolean>("autoApprove", false)
   };
 }
 
-async function getSpecialists(ref: string): Promise<CatalogSpecialist[]> {
-  const cached = catalogCache.get(ref);
-  if (cached) {
-    return cached;
+async function getRuntime(context: vscode.ExtensionContext, key: RuntimeKey): Promise<EmbeddedRuntime> {
+  const signature = JSON.stringify(key);
+  if (cached && cached.key === signature) {
+    return cached.runtime;
   }
-  const specialists = await loadCodingSpecialists(ref);
-  catalogCache.set(ref, specialists);
-  return specialists;
+  if (cached) {
+    await cached.runtime.services.shutdown().catch(() => undefined);
+    cached = null;
+  }
+  const runtime = await createEmbeddedRuntime({
+    appRoot: context.extensionUri.fsPath,
+    workspaceRoot: key.workspaceRoot,
+    storageRoot: context.globalStorageUri.fsPath,
+    apiKey: key.apiKey,
+    baseUrl: key.baseUrl,
+    model: key.model,
+    catalogRef: key.catalogRef
+  });
+  cached = { key: signature, runtime };
+  return runtime;
+}
+
+function describeEvent(event: RunEvent): string | null {
+  const p = event.payload ?? {};
+  switch (event.eventType) {
+    case "task.started":
+      return `▶ **${p.assignedAgentName ?? "Specialist"}** — ${p.name ?? "task"}`;
+    case "task.tool_call": {
+      const ok = p.ok === false ? "✗" : "✓";
+      return `  ${ok} \`${p.tool}\` ${p.targetRef ?? ""} — ${p.outcome ?? ""}`;
+    }
+    case "task.completed":
+      return p.executionSummary ? `  ↳ ${p.executionSummary}` : null;
+    case "approval.requested":
+      return "  ⏸ awaiting approval for a side effect…";
+    default:
+      return null;
+  }
 }
 
 export function activate(context: vscode.ExtensionContext) {
   const handler: vscode.ChatRequestHandler = async (request, _chatContext, stream, token) => {
-    const { inference, catalogRef, autoApprove, maxIterations } = readConfig();
-
-    if (!inference.apiKey) {
+    const cfg = readConfig();
+    if (!cfg.apiKey) {
       stream.markdown(
-        "No inference key set. Add your API key to **commonsCrew.apiKey** in Settings (it stays on your machine — the runtime runs locally and calls your endpoint directly)."
+        "No inference key set. Add your API key to **commonsCrew.apiKey** in Settings — the full commons-crew runtime runs locally in this extension and calls your endpoint directly (BYO key)."
       );
       return;
     }
-
     const folder = vscode.workspace.workspaceFolders?.[0];
     if (!folder) {
-      stream.markdown("Open a folder/workspace first — I work autonomously inside it.");
+      stream.markdown("Open a folder/workspace first — the runtime acts inside it.");
       return;
     }
 
-    stream.progress("Assembling the team from labor-commons…");
-    let specialists: CatalogSpecialist[];
+    stream.progress("Booting the commons-crew runtime and syncing the labor-commons catalog…");
+    let runtime: EmbeddedRuntime;
     try {
-      specialists = await getSpecialists(catalogRef);
-    } catch (err: any) {
-      stream.markdown(`Could not load the catalog: ${err?.message ?? String(err)}`);
+      runtime = await getRuntime(context, {
+        apiKey: cfg.apiKey,
+        model: cfg.model,
+        baseUrl: cfg.baseUrl,
+        catalogRef: cfg.catalogRef,
+        workspaceRoot: folder.uri.fsPath
+      });
+    } catch (error: any) {
+      stream.markdown(`Could not start the runtime: ${error?.message ?? String(error)}`);
       return;
     }
-    if (!specialists.length) {
-      stream.markdown("No software specialists were found in the catalog.");
-      return;
-    }
+    stream.markdown(`Runtime ready — catalog \`labor-commons@${runtime.catalog.ref}\` (${runtime.catalog.commit.slice(0, 7)}).\n\n`);
 
-    // The orchestrator (chat agent) plans a team of governed specialists for the
-    // task; the session runs them under one shared session.
-    const plan = await planTeam(inference, specialists, request.prompt);
-    const specialistsBySlug = new Map(specialists.map((s) => [s.slug, s]));
-    stream.markdown(
-      `Materialized ${plan.steps.length} specialist${plan.steps.length === 1 ? "" : "s"} from labor-commons@${catalogRef}. Working autonomously${autoApprove ? "" : " — I'll ask before each file write or command"}.\n`
+    const outcome = await driveRequest(
+      runtime.services,
+      request.prompt.slice(0, 80) || "commons-crew session",
+      request.prompt,
+      {
+        onEvent(event) {
+          if (token.isCancellationRequested) {
+            return;
+          }
+          const line = describeEvent(event);
+          if (line) {
+            stream.markdown(line + "\n\n");
+          }
+        },
+        async onApproval(approval) {
+          if (cfg.autoApprove) {
+            stream.markdown(`  ✅ auto-approved \`${approval.toolId}\` ${approval.targetRef ?? ""}\n\n`);
+            return "approved";
+          }
+          const pick = await vscode.window.showWarningMessage(
+            `commons-crew wants to run a governed side effect: ${approval.actionSummary}`,
+            { modal: true },
+            "Approve",
+            "Deny"
+          );
+          const decision = pick === "Approve" ? "approved" : "denied";
+          stream.markdown(`  ${decision === "approved" ? "✅ approved" : "🚫 denied"} \`${approval.toolId}\` ${approval.targetRef ?? ""}\n\n`);
+          return decision;
+        }
+      }
     );
 
-    await runSession({
-      config: inference,
-      plan,
-      specialistsBySlug,
-      overallGoal: request.prompt,
-      ctx: { workspaceRoot: folder.uri.fsPath, autoApprove, stream },
-      maxIterations,
-      token
-    });
+    if (outcome.kind === "clarification") {
+      stream.markdown(`I need a bit more detail before starting:\n\n> ${outcome.text}`);
+      return;
+    }
+    if (outcome.kind === "chat") {
+      stream.markdown(outcome.text);
+      return;
+    }
+    stream.markdown(`\n---\n**Run ${outcome.status}.**\n\n${outcome.text}`);
   };
 
   const participant = vscode.chat.createChatParticipant("commons-crew.chat", handler);
@@ -87,5 +149,8 @@ export function activate(context: vscode.ExtensionContext) {
 }
 
 export function deactivate() {
-  catalogCache.clear();
+  if (cached) {
+    void cached.runtime.services.shutdown().catch(() => undefined);
+    cached = null;
+  }
 }

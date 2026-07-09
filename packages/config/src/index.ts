@@ -20,6 +20,7 @@ export const ALLOWED_ENV_OVERRIDES = [
   "PA_PROVIDER_API_KEY",
   "PA_PROVIDER_BASE_URL",
   "PA_PROVIDER_MODEL",
+  "PA_PROVIDER_FALLBACK_MODELS",
   "PA_SPECIALIST_EXECUTION_MODE",
   "PA_FEATURE_FLAGS",
   "PA_API_TOKEN"
@@ -65,6 +66,9 @@ export type AppConfig = {
     apiKey: string | null;
     baseUrl: string;
     model: string;
+    // Ordered fallback models tried when the primary model returns a transient
+    // error (busy / overloaded / 429 / 5xx). Empty by default.
+    fallbackModels: string[];
   };
   auth: {
     apiToken: string | null;
@@ -259,7 +263,18 @@ function isAbsolutePath(value: string) {
 }
 
 function moduleRepoRoot() {
-  return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+  // import.meta.url is empty when this module is bundled to CJS (e.g. embedded in
+  // the VS Code extension). Fall back to cwd so loadConfig never throws; embedding
+  // surfaces override repoRoot explicitly anyway.
+  try {
+    const url = import.meta.url;
+    if (!url) {
+      return process.cwd();
+    }
+    return path.resolve(path.dirname(fileURLToPath(url)), "../../..");
+  } catch {
+    return process.cwd();
+  }
 }
 
 function looksLikeRepoRoot(candidate: string) {
@@ -324,7 +339,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     provider: {
       apiKey: env.PA_PROVIDER_API_KEY ?? null,
       baseUrl: env.PA_PROVIDER_BASE_URL ?? DEFAULT_PROVIDER_BASE_URL,
-      model: env.PA_PROVIDER_MODEL ?? DEFAULT_PROVIDER_MODEL
+      model: env.PA_PROVIDER_MODEL ?? DEFAULT_PROVIDER_MODEL,
+      fallbackModels: (env.PA_PROVIDER_FALLBACK_MODELS ?? "")
+        .split(",")
+        .map((entry) => entry.trim())
+        .filter(Boolean)
     },
     auth: {
       apiToken: env.PA_API_TOKEN ?? null
