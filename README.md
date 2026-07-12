@@ -7,15 +7,21 @@ from [labor-commons](https://github.com/Open-Labor-Foundation/labor-commons)
 for the task rather than running an open-ended agent.
 
 > **Known shortcomings:** see [open-labor-foundation/ARCHITECTURE.md](https://github.com/Open-Labor-Foundation/open-labor-foundation/blob/main/ARCHITECTURE.md)
-> for the full ecosystem picture. Not implemented as envisioned: commons-crew
-> is meant to be a recursively-instantiable delegation primitive, used
-> uniformly at every layer of an organization — including as commons-board's
-> chairs themselves — where one instance delegates to a child instance scoped
-> one level down and reports back up. The current implementation is a single
-> flat personal assistant for one individual, with no delegation between
-> instances, no notion of organizational layer or scope, and no connection
-> back to commons-board. This is the highest-priority piece of unbuilt
-> architecture in the stack; most of what's missing elsewhere depends on it.
+> for the full ecosystem picture. commons-crew is meant to be a
+> recursively-instantiable delegation primitive, used uniformly at every
+> layer of an organization — including as commons-board's chairs themselves.
+> That mechanism is now built and merged: `delegate_to_child` (single-hop and
+> multi-hop, chair → director → department → worker) and `pa.createChairRun`
+> (registers a root run as a specific chair for a specific org) both work end
+> to end, verified against the real public API — see `docs/architecture.md`.
+> What's still missing is on the consumer side: nothing in commons-board
+> calls any of this yet, and commons-crew's own catalog scanner
+> (`LocalCatalogService`) only reads `catalog/naics-overlays` from
+> labor-commons — a second catalog axis for generic corporate-function
+> specialists (`catalog/function-overlays`, planned, not yet migrated) will
+> need that scanner widened once it exists, or a freshly-registered chair
+> still won't be able to find the specialists its own function actually
+> needs.
 
 ## What it does
 
