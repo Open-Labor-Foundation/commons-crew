@@ -25,6 +25,7 @@ import {
   ClarificationThreadView,
   ClarificationState,
   ConfigProfileRecord,
+  type CrewInstanceLayer,
   DelegationDecisionRecord,
   DiagnosticsSnapshot,
   EvaluationRunRecord,
@@ -280,6 +281,17 @@ const ACTION_TOOL_POLICIES: Record<string, ActionPolicyContract> = {
   idempotencyScope: "run_task",
   requiredPermissions: ["external_system_mutation"],
   evidenceShape: "external_change_log"
+  },
+  delegate_to_child: {
+    actionClass: "class_c",
+  readOnly: false,
+  supportsDryRun: false,
+  supportsPreflight: false,
+  supportsRollback: false,
+  requiresApproval: true,
+  idempotencyScope: "run_task",
+  requiredPermissions: ["delegation_spawn"],
+  evidenceShape: "child_run_reference"
   }
 };
 
@@ -2866,6 +2878,8 @@ export async function createAppServices(
     if (shuttingDown) {
       return;
     }
+    const priorState = await store.read();
+    const runBeforeUpdate = priorState.runs.find((run) => run.id === runId) ?? null;
     await store.write((state) => ({
       ...state,
       runs: state.runs.map((run) =>
@@ -2879,6 +2893,23 @@ export async function createAppServices(
       )
     }));
     await syncRunIncident(runId, status);
+
+    // A delegated child reaching a terminal status reports back to whichever
+    // task on the parent delegated it — the parent isn't blocked waiting
+    // (delegation is async, see docs/architecture.md), so this is a
+    // notification the parent picks up when it's next active, not a wake-up.
+    if (runBeforeUpdate?.delegation && terminalRunStatuses.has(status) && runBeforeUpdate.status !== status) {
+      const delegation = runBeforeUpdate.delegation;
+      const finalState = await store.read();
+      const childRun = finalState.runs.find((run) => run.id === runId) ?? null;
+      await appendEvent(delegation.parentRunId, "delegation.completed", {
+        childRunId: runId,
+        childStatus: status,
+        childSummary: childRun?.summary ?? null,
+        layer: delegation.layer,
+        scope: delegation.scope
+      }, delegation.parentTaskId);
+    }
   }
 
   async function failRunForProvider(run: RunRecord, failure: ProviderRunError, taskId: string | null = null, jobId: string | null = null) {
@@ -3428,6 +3459,209 @@ export async function createAppServices(
     }));
   }
 
+  const DELEGATION_LAYER_ORDER: CrewInstanceLayer[] = ["chair", "director", "department", "worker"];
+
+  function nextLayerDown(layer: CrewInstanceLayer): CrewInstanceLayer | null {
+    const index = DELEGATION_LAYER_ORDER.indexOf(layer);
+    if (index === -1 || index === DELEGATION_LAYER_ORDER.length - 1) {
+      return null;
+    }
+    return DELEGATION_LAYER_ORDER[index + 1];
+  }
+
+  /**
+   * Spawns a child commons-crew instance one layer below parentRun, scoped
+   * to a single delegated task. Deliberately simpler than
+   * createRunFromRequest: a delegated child doesn't need specialist
+   * selection, materialization, or plan links at spawn time — it assembles
+   * its own specialists from labor-commons when it actually runs, the same
+   * way any other instance does. Reuses the parent's session/workspace/
+   * work-item/request context rather than synthesizing new records, since a
+   * delegation isn't a new user request, it's an internal continuation of
+   * the same one.
+   */
+  async function createDelegatedChildRun(
+    parentRun: RunRecord,
+    parentTask: TaskRecord,
+    scope: string
+  ): Promise<{ run: RunRecord; task: TaskRecord } | { error: string }> {
+    const parentLayer = parentRun.delegation?.layer ?? "chair";
+    const childLayer = nextLayerDown(parentLayer);
+    if (!childLayer) {
+      return { error: `Layer "${parentLayer}" cannot delegate further — worker is the bottom of the chain.` };
+    }
+
+    const providerStatus = await provider.getStatus();
+    const stateForProvider = await store.read();
+    const activeProviderProfile = getActiveProviderProfile(stateForProvider, providerStatus);
+    const resolvedBudgetProfile = resolveBudgetProfileForRun();
+    const pinnedCatalogSync = await resolveCatalogSyncForRunCreation();
+    if (!pinnedCatalogSync) {
+      return { error: "No catalog sync available to spawn a delegated child run." };
+    }
+
+    const runId = randomUUID();
+    const providerSnapshotId = randomUUID();
+    const providerSnapshot = createProviderSnapshot(
+      providerStatus,
+      activeProviderProfile?.id ?? null,
+      runId,
+      providerSnapshotId
+    );
+    const artifactRootPath = runArtifactRootPath(runId);
+    const workspacePath = runWorkspacePath(runId);
+    await ensureSharedWritableDirectory(artifactRootPath);
+    await ensureSharedWritableDirectory(workspacePath);
+
+    const childRun: RunRecord = {
+      id: runId,
+      workspaceId: parentRun.workspaceId,
+      workItemId: parentRun.workItemId,
+      sessionId: parentRun.sessionId,
+      requestId: parentRun.requestId,
+      traceId: parentRun.traceId,
+      planId: null,
+      catalogSyncRunId: pinnedCatalogSync.id,
+      budgetProfileId: resolvedBudgetProfile.id,
+      rerunSourceRunId: null,
+      rerunTriggeredBy: null,
+      delegation: {
+        parentRunId: parentRun.id,
+        parentTaskId: parentTask.id,
+        layer: childLayer,
+        orgContext: parentRun.delegation?.orgContext ?? null,
+        scope
+      },
+      workspacePath,
+      artifactRootPath,
+      status: "queued",
+      mode: "direct_pa",
+      summary: scope,
+      providerProfileId: activeProviderProfile?.id ?? null,
+      providerCapabilitySnapshotId: providerSnapshotId,
+      providerIdentity: providerSnapshot.capabilities.providerIdentity,
+      providerSnapshot,
+      startedAt: now(),
+      endedAt: null
+    };
+
+    const childTask: TaskRecord = {
+      id: randomUUID(),
+      runId: childRun.id,
+      parentTaskId: null,
+      name: `Delegated: ${scope}`,
+      description: scope,
+      status: "queued",
+      assignedAgentId: null,
+      assignedRuntimeId: null,
+      materializationId: null,
+      taskKind: "operational",
+      approvalRequired: false,
+      resultSummary: null,
+      resultDetail: null,
+      startedAt: null,
+      endedAt: null
+    };
+
+    const runnerJob: RunnerJobRecord = {
+      id: randomUUID(),
+      runId: childRun.id,
+      queueName: "runner",
+      status: "queued",
+      payload: {
+        contractVersion: "runner_job.v1",
+        runId: childRun.id,
+        requestId: childRun.requestId,
+        sessionId: childRun.sessionId,
+        workspaceId: childRun.workspaceId,
+        workItemId: childRun.workItemId,
+        traceId: childRun.traceId,
+        catalogSyncRunId: childRun.catalogSyncRunId,
+        budgetProfileId: childRun.budgetProfileId,
+        workspacePath: childRun.workspacePath,
+        artifactRootPath: childRun.artifactRootPath,
+        providerIdentity: childRun.providerIdentity,
+        mode: childRun.mode,
+        summary: childRun.summary,
+        createdAt: now()
+      },
+      attemptCount: 0,
+      maxAttempts: resolvedBudgetProfile.retryCeiling,
+      runnerId: null,
+      claimedAt: null,
+      startedAt: null,
+      blockedAt: null,
+      endedAt: null,
+      lastHeartbeatAt: null,
+      failure: null,
+      createdAt: now(),
+      updatedAt: now()
+    };
+
+    await store.write((state) => ({
+      ...state,
+      providerCapabilitySnapshots: [providerSnapshot, ...state.providerCapabilitySnapshots],
+      runs: [childRun, ...state.runs],
+      tasks: [childTask, ...state.tasks],
+      runnerJobs: [runnerJob, ...state.runnerJobs]
+    }));
+
+    await appendEvent(childRun.id, "run.delegated_from_parent", {
+      parentRunId: parentRun.id,
+      parentTaskId: parentTask.id,
+      layer: childLayer,
+      scope
+    }, childTask.id);
+
+    await appendEvent(parentRun.id, "delegation.child_created", {
+      childRunId: childRun.id,
+      childTaskId: childTask.id,
+      layer: childLayer,
+      scope
+    }, parentTask.id);
+
+    return { run: childRun, task: childTask };
+  }
+
+  /**
+   * Executor for the delegate_to_child action tool. Unlike the filesystem
+   * tools in action-executor.ts, delegation needs deep access to run/task
+   * state that only exists inside this closure, so it's handled here rather
+   * than in the generic ActionToolExecutor — see docs/architecture.md.
+   */
+  async function executeDelegateToChild(proposal: ActionProposalRecord): Promise<ActionToolExecutionResult> {
+    if (!proposal.runId || !proposal.taskId) {
+      throw new Error("delegate_to_child requires a bound run and task (this should already be enforced by createProposal).");
+    }
+    const state = await store.read();
+    const parentRun = state.runs.find((run) => run.id === proposal.runId) ?? null;
+    const parentTask = state.tasks.find((task) => task.id === proposal.taskId) ?? null;
+    if (!parentRun || !parentTask) {
+      throw new Error("delegate_to_child could not find the delegating run or task.");
+    }
+
+    const result = await createDelegatedChildRun(parentRun, parentTask, proposal.targetRef);
+    if ("error" in result) {
+      throw new Error(result.error);
+    }
+
+    return {
+      actor: "action-tool-executor",
+      dryRun: null,
+      preflight: null,
+      execution: {
+        outcome: "child_run_delegated",
+        payload: {
+          childRunId: result.run.id,
+          childTaskId: result.task.id,
+          layer: result.run.delegation?.layer ?? null,
+          scope: proposal.targetRef
+        }
+      },
+      rollback: null
+    };
+  }
+
   async function createRunFromRequest(
     session: SessionRecord,
     request: RequestRecord,
@@ -3493,6 +3727,7 @@ export async function createAppServices(
       budgetProfileId: resolvedBudgetProfile.id,
       rerunSourceRunId: options.rerunSourceRunId ?? null,
       rerunTriggeredBy: options.rerunTriggeredBy ?? null,
+      delegation: null,
       workspacePath,
       artifactRootPath,
       status: blockedForClarification ? "awaiting_clarification" : "queued",
@@ -6065,11 +6300,13 @@ export async function createAppServices(
       }));
 
       try {
-        const adapterResult: ActionToolExecutionResult = await actionExecutor.execute({
-          actionId,
-          proposal,
-          policy: toolPolicy
-        });
+        const adapterResult: ActionToolExecutionResult = proposal.toolId === "delegate_to_child"
+          ? await executeDelegateToChild(proposal)
+          : await actionExecutor.execute({
+              actionId,
+              proposal,
+              policy: toolPolicy
+            });
         const executedAt = now();
         const dryRunExecutedAt = adapterResult.dryRun ? precheckAt : null;
         const preflightExecutedAt = adapterResult.preflight ? precheckAt : null;
