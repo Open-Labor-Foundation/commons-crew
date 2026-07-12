@@ -3599,19 +3599,52 @@ export async function createAppServices(
       updatedAt: now()
     };
 
+    // Pre-provision the child's own capability to delegate further, unless
+    // it's already at the bottom of the chain. This is the fix for a real
+    // gap found by testing (see docs/architecture.md "Open questions"): an
+    // ApprovalRecord is otherwise only ever auto-created by a run's own task
+    // loop when TaskRecord.approvalRequired is true, and a delegated child's
+    // task is deliberately approvalRequired: false (delegation itself
+    // shouldn't force a human sign-off before the child can even start).
+    // Seeding a *pending* approval here doesn't block the child -- its
+    // runner job is still queued normally -- it just means the capability to
+    // propose delegate_to_child against this child's own run/task exists
+    // from the moment it's created, the same way it exists for a chair.
+    const delegationApproval: ApprovalRecord | null = childLayer !== "worker"
+      ? {
+          id: randomUUID(),
+          runId: childRun.id,
+          taskId: childTask.id,
+          workItemId: childRun.workItemId,
+          requestedByRuntimeId: "pa-runtime",
+          actionSummary: `Pre-authorization for ${childLayer} to delegate further if "${scope}" requires it`,
+          impactScope: "real_world",
+          actionProposalId: null,
+          toolId: null,
+          targetRef: null,
+          expiresAt: null,
+          status: "pending",
+          decisionComment: null,
+          requestedAt: now(),
+          decidedAt: null
+        }
+      : null;
+
     await store.write((state) => ({
       ...state,
       providerCapabilitySnapshots: [providerSnapshot, ...state.providerCapabilitySnapshots],
       runs: [childRun, ...state.runs],
       tasks: [childTask, ...state.tasks],
-      runnerJobs: [runnerJob, ...state.runnerJobs]
+      runnerJobs: [runnerJob, ...state.runnerJobs],
+      approvals: delegationApproval ? [delegationApproval, ...state.approvals] : state.approvals
     }));
 
     await appendEvent(childRun.id, "run.delegated_from_parent", {
       parentRunId: parentRun.id,
       parentTaskId: parentTask.id,
       layer: childLayer,
-      scope
+      scope,
+      delegationApprovalId: delegationApproval?.id ?? null
     }, childTask.id);
 
     await appendEvent(parentRun.id, "delegation.child_created", {
