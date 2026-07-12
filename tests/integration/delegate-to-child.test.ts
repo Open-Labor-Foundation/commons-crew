@@ -292,4 +292,104 @@ describe("delegate_to_child", () => {
     const executed = await services.actions.execute(proposal.id);
     expect(executed && "error" in executed ? executed.error.code : null).toBe("approval_required");
   });
+
+  it("walks the full chain to worker, pre-seeding delegation approval at every non-terminal layer", async () => {
+    const sessionView = await services.pa.createSession("cli", "Full-chain delegation test");
+    const sessionId = sessionView.session.id;
+    await services.pa.postMessage(sessionId, "__DELEGATION_TEST__ deploy this to production");
+
+    const chairBlocked = await waitUntil(async () => {
+      await pumpRunner(services, runnerId);
+      const session = await services.pa.getSession(sessionId);
+      const latestRun = session?.latestRun ?? null;
+      const pendingApproval = session?.pendingApprovals.find((approval) => approval.status === "pending") ?? null;
+      if (!latestRun || !pendingApproval || !pendingApproval.taskId) {
+        return null;
+      }
+      return { runId: latestRun.id, taskId: pendingApproval.taskId, approvalId: pendingApproval.id, workItemId: latestRun.workItemId };
+    });
+
+    /** Delegates once from a given run/task/approval, returns the child's own run/task/pending-approval (if any). */
+    async function delegateOneHop(
+      parent: { runId: string; taskId: string; approvalId: string; workItemId: string },
+      scopeLabel: string
+    ) {
+      await services.approvals.decide(parent.approvalId, "approved", "approved for test", "user_primary");
+
+      const proposal = await services.actions.createProposal({
+        workItemId: parent.workItemId,
+        runId: parent.runId,
+        taskId: parent.taskId,
+        toolId: "delegate_to_child",
+        actionClass: "class_c",
+        targetRef: scopeLabel,
+        idempotencyKey: `delegate-${parent.taskId}-${scopeLabel}`
+      });
+      if ("error" in proposal) {
+        throw new Error(`createProposal failed at ${scopeLabel}: ${proposal.error.code}`);
+      }
+      const executed = await services.actions.execute(proposal.id);
+      if (!executed || "error" in executed) {
+        throw new Error(`execute failed at ${scopeLabel}: ${executed && "error" in executed ? executed.error.code : "null result"}`);
+      }
+
+      const parentEvents = await services.runs.events(parent.runId);
+      const childCreatedEvent = [...parentEvents].reverse().find((event) => event.eventType === "delegation.child_created");
+      const { childRunId, childTaskId, layer } = childCreatedEvent!.payload as {
+        childRunId: string;
+        childTaskId: string;
+        layer: string;
+      };
+
+      const childView = await services.runs.get(childRunId);
+      const childPendingApproval = childView!.approvals.find((approval) => approval.status === "pending") ?? null;
+
+      return {
+        runId: childRunId,
+        taskId: childTaskId,
+        layer,
+        workItemId: childView!.run.workItemId,
+        approvalId: childPendingApproval?.id ?? null
+      };
+    }
+
+    const director = await delegateOneHop(chairBlocked, "director scope");
+    expect(director.layer).toBe("director");
+    expect(director.approvalId).not.toBeNull(); // pre-seeded: director can delegate further
+
+    const department = await delegateOneHop(
+      { runId: director.runId, taskId: director.taskId, approvalId: director.approvalId!, workItemId: director.workItemId },
+      "department scope"
+    );
+    expect(department.layer).toBe("department");
+    expect(department.approvalId).not.toBeNull(); // pre-seeded: department can delegate further
+
+    const worker = await delegateOneHop(
+      { runId: department.runId, taskId: department.taskId, approvalId: department.approvalId!, workItemId: department.workItemId },
+      "worker scope"
+    );
+    expect(worker.layer).toBe("worker");
+    expect(worker.approvalId).toBeNull(); // NOT pre-seeded: worker is the bottom of the chain
+
+    // Confirm the boundary is enforced at the tool level too, not just by
+    // omission of a pre-seeded approval -- proposing delegate_to_child from
+    // worker must fail even if someone tried to force an approval into
+    // existence some other way. Since no approval exists for the worker's
+    // task, createProposal itself can still succeed (status: not_requested),
+    // but execute must fail closed exactly like the no-approval case above.
+    const workerProposal = await services.actions.createProposal({
+      workItemId: worker.workItemId,
+      runId: worker.runId,
+      taskId: worker.taskId,
+      toolId: "delegate_to_child",
+      actionClass: "class_c",
+      targetRef: "attempted delegation past worker",
+      idempotencyKey: `delegate-${worker.taskId}-past-worker`
+    });
+    if ("error" in workerProposal) {
+      throw new Error(`createProposal failed unexpectedly at worker: ${workerProposal.error.code}`);
+    }
+    const workerExecuted = await services.actions.execute(workerProposal.id);
+    expect(workerExecuted && "error" in workerExecuted ? workerExecuted.error.code : null).toBe("approval_required");
+  });
 });

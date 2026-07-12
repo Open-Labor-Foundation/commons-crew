@@ -8,8 +8,10 @@ level down from whichever instance created it. See
 for how this fits the rest of the stack; this document is about how the
 mechanism itself works.
 
-**Status: the core mechanism below is implemented** on
-`feature/recursive-delegation`, not yet merged to `main`. Chair
+**Status: implemented and merged to `main`.** Single-hop and multi-hop
+delegation both work end to end, verified by real tests exercising the
+public propose → approve → execute API (`tests/integration/delegate-to-child.test.ts`),
+including a full chair → director → department → worker chain. Chair
 registration with commons-board and dynamic chair assignment are still
 open (see below).
 
@@ -144,20 +146,15 @@ depends on this remaining a tree, not a set of disconnected islands.
   it — isn't decided. Nothing in this implementation creates a root/chair
   instance yet; `createDelegatedChildRun` only handles the child side of
   one delegation hop.
-- **Multi-hop chains beyond one level — a real gap, found by testing, not
-  just unverified.** A delegated child's own task is created with
-  `approvalRequired: false` (see Instance identity / `createDelegatedChildRun`),
-  and an `ApprovalRecord` is currently only ever auto-created by a run's
-  task loop when `TaskRecord.approvalRequired` is true — there is no public
-  way to request an approval standalone. That means a director-layer child
-  cannot itself propose a further `delegate_to_child` hop through the
-  current public API at all, approved or not — `createProposal` requires an
-  existing `ApprovalRecord` for the run/task pair, and none exists.
-  Multi-hop chains (director → department → worker) need one of: giving
-  delegated tasks their own `approvalRequired` flag, or a standalone
-  "request approval" entry point independent of the task loop. Neither is
-  built. Verified end to end for exactly one hop (chair → director);
-  the boundary condition (`nextLayerDown("worker") === null`) is unit
-  tested directly, but the department/worker layers themselves are
-  unreachable through the current wiring regardless of that boundary check
-  ever being hit.
+- ~~Multi-hop chains beyond one level~~ **Fixed.** `createDelegatedChildRun`
+  now seeds a *pending* `ApprovalRecord` on the child's own run/task at
+  spawn time for any layer except `worker` — pre-provisioning the
+  capability to delegate further without forcing a human sign-off before
+  the child can even start (the seeded approval only matters if and when
+  the child itself proposes `delegate_to_child`; it doesn't block the
+  child's own task, which stays `approvalRequired: false`). Verified end to
+  end for the full chain — chair → director → department → worker — in
+  `tests/integration/delegate-to-child.test.ts`, including confirming
+  worker gets no seeded approval and any delegation attempt from worker
+  fails closed the same way an unapproved attempt does anywhere else in
+  the chain.
