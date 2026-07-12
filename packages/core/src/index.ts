@@ -17,6 +17,9 @@ import {
   BudgetProfile,
   CatalogEntry,
   CatalogSyncRecord,
+  CHAIR_ROLES,
+  type ChairRegistration,
+  type ChairRole,
   ChatAnswer,
   ChatAnswerInput,
   ClarificationRecord,
@@ -3530,9 +3533,10 @@ export async function createAppServices(
         parentRunId: parentRun.id,
         parentTaskId: parentTask.id,
         layer: childLayer,
-        orgContext: parentRun.delegation?.orgContext ?? null,
+        orgContext: parentRun.delegation?.orgContext ?? parentRun.chairRegistration?.orgContext ?? null,
         scope
       },
+      chairRegistration: null,
       workspacePath,
       artifactRootPath,
       status: "queued",
@@ -3696,6 +3700,119 @@ export async function createAppServices(
     };
   }
 
+  /**
+   * The counterpart to createDelegatedChildRun for the top of a chain: an
+   * external caller (commons-board, during its onboarding flow) uses this
+   * to instantiate a commons-crew run and register it as a specific chair
+   * for a specific org, rather than going through the conversational
+   * intake path (decideIntake, specialist selection) that ordinary
+   * personal-assistant runs go through -- chair registration is an
+   * administrative act, not a request to classify.
+   */
+  async function createChairRun(input: {
+    orgContext: string;
+    chairRole: ChairRole;
+    surface: Surface;
+    title: string;
+  }): Promise<{ session: SessionRecord; run: RunRecord } | { error: string }> {
+    if (!(CHAIR_ROLES as readonly string[]).includes(input.chairRole)) {
+      return { error: `"${input.chairRole}" is not a recognized chair role. Valid roles: ${CHAIR_ROLES.join(", ")}.` };
+    }
+    if (!input.orgContext.trim()) {
+      return { error: "orgContext is required to register a chair." };
+    }
+
+    const timestamp = now();
+    const session: SessionRecord = {
+      id: randomUUID(),
+      workspaceId: createDefaultState().workspace.id,
+      workItemId: null,
+      surface: input.surface,
+      title: input.title,
+      status: "active",
+      createdAt: timestamp,
+      updatedAt: timestamp
+    };
+
+    const registrationContent = `Registered as the ${input.chairRole} chair for ${input.orgContext}.`;
+    const userMessage: MessageRecord = {
+      id: randomUUID(),
+      sessionId: session.id,
+      authorType: "user",
+      content: registrationContent,
+      messageKind: "chat",
+      createdAt: now()
+    };
+    const request: RequestRecord = {
+      id: randomUUID(),
+      sessionId: session.id,
+      messageId: userMessage.id,
+      requestType: "execution",
+      status: "accepted",
+      createdAt: now()
+    };
+
+    await store.write((state) => ({
+      ...state,
+      sessions: [session, ...state.sessions],
+      messages: [...state.messages, userMessage],
+      requests: [request, ...state.requests]
+    }));
+
+    const created = await createRunFromRequest(
+      session,
+      request,
+      registrationContent,
+      { selectedEntries: [], candidatesByEntryId: new Map() },
+      { chairRegistration: { orgContext: input.orgContext, chairRole: input.chairRole } }
+    );
+    if (!created) {
+      return { error: "Failed to create the chair run (work item or catalog sync resolution failed)." };
+    }
+
+    // A chair is never worker-layer, so -- same reasoning as the
+    // non-worker-layer seeding in createDelegatedChildRun -- it should be
+    // able to delegate from the moment it's registered, not only once one
+    // of its own tasks happens to trip requiresApproval(). Registration
+    // content doesn't trip that regex on purpose (registering a chair isn't
+    // itself a risky action), so the capability has to be seeded explicitly
+    // here instead of arising from the ordinary task-loop path.
+    const stateAfterCreate = await store.read();
+    const createdTasks = stateAfterCreate.tasks.filter((task) => task.runId === created.run.id);
+    const delegationTargetTask = createdTasks.find((task) => task.name === "Execute planned work") ?? createdTasks[0] ?? null;
+    if (delegationTargetTask) {
+      const chairDelegationApproval: ApprovalRecord = {
+        id: randomUUID(),
+        runId: created.run.id,
+        taskId: delegationTargetTask.id,
+        workItemId: created.run.workItemId,
+        requestedByRuntimeId: "pa-runtime",
+        actionSummary: `Pre-authorization for the ${input.chairRole} chair to delegate to a director-layer instance if needed`,
+        impactScope: "real_world",
+        actionProposalId: null,
+        toolId: null,
+        targetRef: null,
+        expiresAt: null,
+        status: "pending",
+        decisionComment: null,
+        requestedAt: now(),
+        decidedAt: null
+      };
+      await store.write((state) => ({
+        ...state,
+        approvals: [chairDelegationApproval, ...state.approvals]
+      }));
+    }
+
+    await appendEvent(created.run.id, "run.chair_registered", {
+      orgContext: input.orgContext,
+      chairRole: input.chairRole,
+      delegationApprovalId: delegationTargetTask ? "seeded" : null
+    });
+
+    return { session, run: created.run };
+  }
+
   async function createRunFromRequest(
     session: SessionRecord,
     request: RequestRecord,
@@ -3712,6 +3829,7 @@ export async function createAppServices(
       workItemIdOverride?: string | null;
       rerunSourceRunId?: string | null;
       rerunTriggeredBy?: "operator" | null;
+      chairRegistration?: ChairRegistration | null;
     } = {}
   ) {
     const blockedForClarification = options.blockedForClarification ?? false;
@@ -3762,6 +3880,7 @@ export async function createAppServices(
       rerunSourceRunId: options.rerunSourceRunId ?? null,
       rerunTriggeredBy: options.rerunTriggeredBy ?? null,
       delegation: null,
+      chairRegistration: options.chairRegistration ?? null,
       workspacePath,
       artifactRootPath,
       status: blockedForClarification ? "awaiting_clarification" : "queued",
@@ -4629,6 +4748,15 @@ export async function createAppServices(
 
     async getSession(sessionId: string) {
       return await getSessionView(sessionId);
+    },
+
+    /**
+     * Entry point for an external caller (commons-board, during its
+     * onboarding flow) to instantiate a commons-crew run and register it as
+     * a specific chair for a specific org. See createChairRun.
+     */
+    async createChairRun(input: { orgContext: string; chairRole: ChairRole; surface: Surface; title: string }) {
+      return await createChairRun(input);
     },
 
     async postMessage(sessionId: string, content: string, options: { traceId?: string } = {}) {
