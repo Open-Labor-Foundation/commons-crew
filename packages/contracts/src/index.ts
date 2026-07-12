@@ -727,6 +727,21 @@ export type ClarificationThreadView = {
   messages: ClarificationMessageRecord[];
 };
 
+export type CrewInstanceLayer = "chair" | "director" | "department" | "worker";
+
+/**
+ * Present only on a run spawned by delegate_to_child. Absent (null) on a
+ * root instance — a chair, or a standalone personal-assistant run with no
+ * organizational context. See commons-crew docs/architecture.md.
+ */
+export type DelegationLineage = {
+  parentRunId: string;
+  parentTaskId: string;
+  layer: CrewInstanceLayer;
+  orgContext: string | null;
+  scope: string;
+};
+
 export type RunRecord = {
   id: string;
   workspaceId: string;
@@ -739,6 +754,7 @@ export type RunRecord = {
   budgetProfileId: string;
   rerunSourceRunId: string | null;
   rerunTriggeredBy: "operator" | null;
+  delegation: DelegationLineage | null;
   workspacePath: string;
   artifactRootPath: string;
   status: RunStatus;
