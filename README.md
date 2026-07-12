@@ -6,6 +6,17 @@ describe what you need, and commons-crew assembles the right specialists
 from [labor-commons](https://github.com/Open-Labor-Foundation/labor-commons)
 for the task rather than running an open-ended agent.
 
+> **Known shortcomings:** see [open-labor-foundation/ARCHITECTURE.md](https://github.com/Open-Labor-Foundation/open-labor-foundation/blob/main/ARCHITECTURE.md)
+> for the full ecosystem picture. Not implemented as envisioned: commons-crew
+> is meant to be a recursively-instantiable delegation primitive, used
+> uniformly at every layer of an organization — including as commons-board's
+> chairs themselves — where one instance delegates to a child instance scoped
+> one level down and reports back up. The current implementation is a single
+> flat personal assistant for one individual, with no delegation between
+> instances, no notion of organizational layer or scope, and no connection
+> back to commons-board. This is the highest-priority piece of unbuilt
+> architecture in the stack; most of what's missing elsewhere depends on it.
+
 ## What it does
 
 - Accepts open-ended requests in plain language — no fixed task menu
