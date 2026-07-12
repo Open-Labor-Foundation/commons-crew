@@ -144,7 +144,20 @@ depends on this remaining a tree, not a set of disconnected islands.
   it — isn't decided. Nothing in this implementation creates a root/chair
   instance yet; `createDelegatedChildRun` only handles the child side of
   one delegation hop.
-- **Multi-hop chains beyond one level.** Verified end to end for a single
-  parent → child hop. A child delegating to its own child (director →
-  department) should work by the same mechanism, but hasn't been
-  exercised by a test yet.
+- **Multi-hop chains beyond one level — a real gap, found by testing, not
+  just unverified.** A delegated child's own task is created with
+  `approvalRequired: false` (see Instance identity / `createDelegatedChildRun`),
+  and an `ApprovalRecord` is currently only ever auto-created by a run's
+  task loop when `TaskRecord.approvalRequired` is true — there is no public
+  way to request an approval standalone. That means a director-layer child
+  cannot itself propose a further `delegate_to_child` hop through the
+  current public API at all, approved or not — `createProposal` requires an
+  existing `ApprovalRecord` for the run/task pair, and none exists.
+  Multi-hop chains (director → department → worker) need one of: giving
+  delegated tasks their own `approvalRequired` flag, or a standalone
+  "request approval" entry point independent of the task loop. Neither is
+  built. Verified end to end for exactly one hop (chair → director);
+  the boundary condition (`nextLayerDown("worker") === null`) is unit
+  tested directly, but the department/worker layers themselves are
+  unreachable through the current wiring regardless of that boundary check
+  ever being hit.

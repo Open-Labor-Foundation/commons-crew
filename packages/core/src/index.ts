@@ -363,6 +363,17 @@ function requiresApproval(content: string) {
   return /(delete|deploy|publish|email|message someone|production|real world|external system)/.test(lower);
 }
 
+export const DELEGATION_LAYER_ORDER: CrewInstanceLayer[] = ["chair", "director", "department", "worker"];
+
+/** Pure and dependency-free by design so it's directly unit-testable without bootstrapping createAppServices. */
+export function nextLayerDown(layer: CrewInstanceLayer): CrewInstanceLayer | null {
+  const index = DELEGATION_LAYER_ORDER.indexOf(layer);
+  if (index === -1 || index === DELEGATION_LAYER_ORDER.length - 1) {
+    return null;
+  }
+  return DELEGATION_LAYER_ORDER[index + 1];
+}
+
 function normalizeContent(content: string) {
   return content.trim().replace(/\s+/g, " ");
 }
@@ -3457,16 +3468,6 @@ export async function createAppServices(
           : thread
       )
     }));
-  }
-
-  const DELEGATION_LAYER_ORDER: CrewInstanceLayer[] = ["chair", "director", "department", "worker"];
-
-  function nextLayerDown(layer: CrewInstanceLayer): CrewInstanceLayer | null {
-    const index = DELEGATION_LAYER_ORDER.indexOf(layer);
-    if (index === -1 || index === DELEGATION_LAYER_ORDER.length - 1) {
-      return null;
-    }
-    return DELEGATION_LAYER_ORDER[index + 1];
   }
 
   /**
