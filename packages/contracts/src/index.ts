@@ -742,6 +742,26 @@ export type DelegationLineage = {
   scope: string;
 };
 
+/**
+ * v1 fixed chair set — see docs/architecture.md "Chair assignment (v1: fixed,
+ * not dynamic)". Matches commons-board's own README. Dynamic chair creation
+ * is deliberately out of scope until this fixed set has proven out.
+ */
+export const CHAIR_ROLES = ["finance", "legal", "hr", "marketing", "operations", "product"] as const;
+export type ChairRole = (typeof CHAIR_ROLES)[number];
+
+/**
+ * Present only on a root run created via pa.createChairRun — the counterpart
+ * to DelegationLineage for the top of a chain rather than a delegated hop.
+ * A chair-registered run has no parentRunId (nothing delegated to it; an
+ * external caller such as commons-board created it directly) but still
+ * needs an explicit orgContext so its own descendants can inherit one.
+ */
+export type ChairRegistration = {
+  orgContext: string;
+  chairRole: ChairRole;
+};
+
 export type RunRecord = {
   id: string;
   workspaceId: string;
@@ -755,6 +775,7 @@ export type RunRecord = {
   rerunSourceRunId: string | null;
   rerunTriggeredBy: "operator" | null;
   delegation: DelegationLineage | null;
+  chairRegistration: ChairRegistration | null;
   workspacePath: string;
   artifactRootPath: string;
   status: RunStatus;

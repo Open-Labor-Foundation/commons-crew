@@ -11,9 +11,10 @@ mechanism itself works.
 **Status: implemented and merged to `main`.** Single-hop and multi-hop
 delegation both work end to end, verified by real tests exercising the
 public propose → approve → execute API (`tests/integration/delegate-to-child.test.ts`),
-including a full chair → director → department → worker chain. Chair
-registration with commons-board and dynamic chair assignment are still
-open (see below).
+including a full chair → director → department → worker chain.
+`pa.createChairRun` (see Instance identity) gives commons-crew its own
+side of chair registration; commons-board actually calling it during
+onboarding, and dynamic chair assignment, are still open (see below).
 
 One correction from the original version of this document, found while
 implementing: there is no autonomous LLM tool-call loop in this codebase.
@@ -45,6 +46,30 @@ This extends the existing domain model rather than replacing it — a field
 added to `RunRecord` (`packages/contracts/src/index.ts`), alongside the
 existing `rerunSourceRunId`/`rerunTriggeredBy` lineage pair that was the
 closest existing precedent for one run pointing back to another.
+
+A root run can also carry a `chairRegistration` field instead —
+`{ orgContext, chairRole }`, `chairRole` restricted to the fixed v1 set
+(see Chair assignment below). This is the counterpart to `delegation` for
+the *top* of a chain: nothing delegated to a chair, an external caller
+created it directly, so there's no `parentRunId`/`parentTaskId` to carry.
+`pa.createChairRun(orgContext, chairRole, surface, title)` is the entry
+point — it bypasses the conversational intake path (`decideIntake`,
+specialist selection) entirely, since registering a chair is an
+administrative act, not a request to classify. A run is never both —
+`delegation` and `chairRegistration` are mutually exclusive by
+construction (a delegated child always gets `chairRegistration: null`).
+`layer` for a chair-registered run is implicit rather than stored
+directly: `nextLayerDown` already treats any run with no `delegation` as
+chair-layer (`parentRun.delegation?.layer ?? "chair"`), so a
+chair-registered root run and an ordinary unregistered root run behave
+identically for delegation purposes — registration's job is narrower:
+attaching an explicit `orgContext` so descendants inherit one
+(`createDelegatedChildRun` now checks `chairRegistration.orgContext` as a
+fallback alongside `delegation.orgContext`), and pre-seeding the same
+delegation-capability approval a non-worker delegated child gets (see
+Delegation mechanism) so a freshly registered chair can delegate
+immediately rather than waiting for one of its own tasks to happen to
+trip `requiresApproval()`.
 
 ## Delegation mechanism
 
@@ -140,12 +165,19 @@ depends on this remaining a tree, not a set of disconnected islands.
 
 - **Dynamic chair assignment.** Revisit only after the recursive mechanism
   is proven with the fixed chair set above.
-- **Chair registration with commons-board.** How a root commons-crew
-  instance actually becomes "the IT chair" for a specific commons-board
-  deployment — direct spawn by commons-board, or self-registration against
-  it — isn't decided. Nothing in this implementation creates a root/chair
-  instance yet; `createDelegatedChildRun` only handles the child side of
-  one delegation hop.
+- **Chair registration with commons-board — half built.** `pa.createChairRun`
+  gives commons-crew the capability (register a root run as a specific
+  `chairRole` for a specific `orgContext`, with delegation pre-authorized
+  immediately, verified in `tests/integration/chair-registration.test.ts`).
+  What's still missing is the other side: nothing in commons-board calls
+  this yet. commons-board's own onboarding flow still uses its pre-existing
+  direct SQL resolver against labor-commons to "staff chairs"
+  (`services/api/src/lib/specialist-resolver.ts` per the ecosystem audit),
+  entirely independent of commons-crew. That resolver needs to be replaced
+  with a call to `pa.createChairRun` per chair during onboarding — a
+  cross-repo integration this document can't fully specify without the
+  equivalent depth of investigation into commons-board's own codebase that
+  went into this one.
 - ~~Multi-hop chains beyond one level~~ **Fixed.** `createDelegatedChildRun`
   now seeds a *pending* `ApprovalRecord` on the child's own run/task at
   spawn time for any layer except `worker` — pre-provisioning the
