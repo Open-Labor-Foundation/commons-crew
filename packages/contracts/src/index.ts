@@ -746,8 +746,12 @@ export type DelegationLineage = {
  * v1 fixed chair set — see docs/architecture.md "Chair assignment (v1: fixed,
  * not dynamic)". Matches commons-board's own README. Dynamic chair creation
  * is deliberately out of scope until this fixed set has proven out.
+ *
+ * "it" and "security" cover the two guaranteed onboarding domains
+ * commons-board's chair-context prompt always produces (ui_domain "it" and
+ * "security") that don't map onto any of the original six.
  */
-export const CHAIR_ROLES = ["finance", "legal", "hr", "marketing", "operations", "product"] as const;
+export const CHAIR_ROLES = ["finance", "legal", "hr", "marketing", "operations", "product", "it", "security"] as const;
 export type ChairRole = (typeof CHAIR_ROLES)[number];
 
 /**

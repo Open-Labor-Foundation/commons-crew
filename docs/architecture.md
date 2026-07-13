@@ -13,8 +13,12 @@ delegation both work end to end, verified by real tests exercising the
 public propose → approve → execute API (`tests/integration/delegate-to-child.test.ts`),
 including a full chair → director → department → worker chain.
 `pa.createChairRun` (see Instance identity) gives commons-crew its own
-side of chair registration; commons-board actually calling it during
-onboarding, and dynamic chair assignment, are still open (see below).
+side of chair registration, now reachable externally via `POST /api/chairs`
+(`apps/crew-api/src/create-app.ts`) — commons-board's onboarding flow calls
+it to register every chair as a real commons-crew run. Dynamic chair
+assignment is still open (see below); routing a chair's live task execution
+through its own run so `delegate_to_child` chains actually fire is a
+distinct, larger integration also still open (see below).
 
 One correction from the original version of this document, found while
 implementing: there is no autonomous LLM tool-call loop in this codebase.
@@ -165,19 +169,32 @@ depends on this remaining a tree, not a set of disconnected islands.
 
 - **Dynamic chair assignment.** Revisit only after the recursive mechanism
   is proven with the fixed chair set above.
-- **Chair registration with commons-board — half built.** `pa.createChairRun`
-  gives commons-crew the capability (register a root run as a specific
-  `chairRole` for a specific `orgContext`, with delegation pre-authorized
-  immediately, verified in `tests/integration/chair-registration.test.ts`).
-  What's still missing is the other side: nothing in commons-board calls
-  this yet. commons-board's own onboarding flow still uses its pre-existing
-  direct SQL resolver against labor-commons to "staff chairs"
-  (`services/api/src/lib/specialist-resolver.ts` per the ecosystem audit),
-  entirely independent of commons-crew. That resolver needs to be replaced
-  with a call to `pa.createChairRun` per chair during onboarding — a
-  cross-repo integration this document can't fully specify without the
-  equivalent depth of investigation into commons-board's own codebase that
-  went into this one.
+- ~~Chair registration with commons-board — half built.~~ **Resolved.**
+  `pa.createChairRun` is reachable externally via `POST /api/chairs`
+  (`apps/crew-api/src/create-app.ts`), and commons-board's onboarding flow
+  (`generate-artifacts.ts`'s `buildBlueprintChairs`) calls it once per chair
+  at the point the chair is created, storing the returned run/session id on
+  the chair record. `CHAIR_ROLES` grew from six to eight (`it`, `security`
+  added) to cover commons-board's actual guaranteed onboarding domain set —
+  without that, two of every org's six chairs would have failed
+  registration outright.
+
+  This is deliberately scoped: commons-board keeps its own axis-aware
+  labor-commons search as the mechanism that picks which specialist to
+  preview/pin for a chair at onboarding (a legitimate, human-reviewable
+  product behavior, not what this gap was about). What changed is that
+  every chair is now also a real, governed commons-crew run — audit trail,
+  autonomy tiers, and `delegate_to_child` capability all now exist for every
+  chair from the moment it's created.
+
+- **Routing live task execution through a chair's own run — not yet
+  started.** Registration alone doesn't make delegation happen: a chair's
+  `commons_crew_run_id` currently sits unused once onboarding finishes.
+  Actually dispatching an org's day-to-day work through that run — so
+  `delegate_to_child` chains fire for real and reach the line-level catalog
+  (director → department → worker) — requires deciding how commons-board's
+  task/workflow model maps onto commons-crew's session/message model. That's
+  a distinct, larger integration; this document doesn't specify it yet.
 - ~~Multi-hop chains beyond one level~~ **Fixed.** `createDelegatedChildRun`
   now seeds a *pending* `ApprovalRecord` on the child's own run/task at
   spawn time for any layer except `worker` — pre-provisioning the
