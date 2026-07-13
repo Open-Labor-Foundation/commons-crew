@@ -663,6 +663,30 @@ export async function createApiApp(
     return await services.pa.createSession(body.surface ?? "cli", body.title ?? "PA session");
   });
 
+  // Counterpart to pa.createChairRun for an external caller (commons-board,
+  // during its onboarding flow) to register a root run as a specific chair
+  // for a specific org — see packages/core/src/index.ts's createChairRun.
+  app.post("/api/chairs", async (request, reply) => {
+    const body = (request.body ?? {}) as {
+      orgContext?: string;
+      chairRole?: string;
+      surface?: "cli" | "web";
+      title?: string;
+    };
+    const result = await services.pa.createChairRun({
+      orgContext: body.orgContext ?? "",
+      chairRole: (body.chairRole ?? "") as never,
+      surface: body.surface ?? "web",
+      title: body.title ?? "Chair"
+    });
+    if ("error" in result) {
+      reply.code(422);
+      return { error: { code: "invalid_chair_registration", message: result.error, retryable: false } };
+    }
+    reply.code(201);
+    return result;
+  });
+
   app.get("/api/sessions/:sessionId", async (request, reply) => {
     const params = request.params as { sessionId: string };
     const session = await services.pa.getSession(params.sessionId);
