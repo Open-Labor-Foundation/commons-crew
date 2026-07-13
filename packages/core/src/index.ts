@@ -252,6 +252,17 @@ const ACTION_TOOL_POLICIES: Record<string, ActionPolicyContract> = {
   requiredPermissions: ["workspace_read"],
   evidenceShape: "artifact_list"
   },
+  search_artifacts: {
+    actionClass: "class_a",
+  readOnly: true,
+  supportsDryRun: false,
+  supportsPreflight: false,
+  supportsRollback: false,
+  requiresApproval: false,
+  idempotencyScope: "run_task",
+  requiredPermissions: ["catalog_read"],
+  evidenceShape: "artifact_search_result"
+  },
   write_file: {
     actionClass: "class_b",
   readOnly: false,

@@ -62,6 +62,83 @@ async function pathExists(location: string) {
   }
 }
 
+type ArtifactCatalogPack = {
+  id: string;
+  name: string;
+  description: string;
+  status: string;
+  artifact_types: string[];
+  tags?: string[];
+};
+
+export type ArtifactSearchMatch = {
+  id: string;
+  name: string;
+  description: string;
+  status: string;
+  artifact_types: string[];
+  tags: string[];
+  score: number;
+};
+
+const ARTIFACT_SEARCH_RESULT_LIMIT = 5;
+
+/**
+ * Matches ARCHITECTURE.md's resolution of artifact-commons matching: "a
+ * commons-crew tool, not a separate service... the same governed loop that
+ * already exists, just with one more tool type added to it." No ranking
+ * service, no separate catalog client class -- artifact-commons' catalog.json
+ * is a flat index (unlike labor-commons' per-file spec.yaml tree), so a
+ * direct read-and-score here is the whole mechanism, same as read_file and
+ * inspect_workspace above don't go through an abstraction either.
+ *
+ * Returns null (not an empty array) when the catalog file itself can't be
+ * read, so the caller can distinguish "checked, nothing matched" from
+ * "artifact-commons isn't checked out at this path" -- artifact-commons is
+ * an optional dependency, not every commons-crew deployment will have it.
+ */
+async function searchArtifactCatalog(catalogPath: string, query: string): Promise<ArtifactSearchMatch[] | null> {
+  let raw: string;
+  try {
+    raw = await fs.readFile(catalogPath, "utf8");
+  } catch {
+    return null;
+  }
+
+  let parsed: { packs?: ArtifactCatalogPack[] };
+  try {
+    parsed = JSON.parse(raw) as { packs?: ArtifactCatalogPack[] };
+  } catch {
+    return null;
+  }
+
+  const packs = parsed.packs ?? [];
+  const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
+  if (terms.length === 0) return [];
+
+  const scored = packs.map((pack) => {
+    const haystack = [pack.id, pack.name, pack.description, ...(pack.artifact_types ?? []), ...(pack.tags ?? [])]
+      .join(" ")
+      .toLowerCase();
+    const score = terms.reduce((count, term) => (haystack.includes(term) ? count + 1 : count), 0);
+    return { pack, score };
+  });
+
+  return scored
+    .filter((entry) => entry.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, ARTIFACT_SEARCH_RESULT_LIMIT)
+    .map(({ pack, score }) => ({
+      id: pack.id,
+      name: pack.name,
+      description: pack.description,
+      status: pack.status,
+      artifact_types: pack.artifact_types ?? [],
+      tags: pack.tags ?? [],
+      score
+    }));
+}
+
 function actionWorkspaceRoot(config: AppConfig, actionId: string) {
   return path.join(config.paths.artifactsRoot, "action-tool-workspaces", actionId);
 }
@@ -129,6 +206,24 @@ export function createDefaultActionToolExecutor(config: AppConfig): ActionToolEx
               entryCount: entries.length,
               sample: listing
             }
+          },
+          rollback: null
+        };
+      }
+
+      if (proposal.toolId === "search_artifacts") {
+        const query = proposal.targetRef;
+        const catalogPath = path.join(config.paths.artifactCommonsRoot, "catalog.json");
+        const matches = await searchArtifactCatalog(catalogPath, query);
+        return {
+          actor,
+          dryRun: null,
+          preflight: null,
+          execution: {
+            outcome: matches === null ? "artifact_catalog_unavailable" : "artifact_search_completed",
+            payload: matches === null
+              ? { query, catalogPath, reason: "artifact-commons is not checked out at the configured path" }
+              : { query, matchCount: matches.length, matches }
           },
           rollback: null
         };

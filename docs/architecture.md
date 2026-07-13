@@ -197,6 +197,51 @@ must still be traversable down into its children's logs on demand, so the
 whole tree is auditable end to end. commons-board's immutable audit trail
 depends on this remaining a tree, not a set of disconnected islands.
 
+## Artifact matching: `search_artifacts`
+
+`open-labor-foundation/ARCHITECTURE.md` resolves artifact-commons matching
+as "a commons-crew tool, not a separate service... the same governed loop
+that already exists, just with one more tool type added to it." This is
+that tool.
+
+`search_artifacts` is `class_a` — read-only, no approval required, no dry
+run or preflight (there's nothing to preview; a search either finds
+matches or it doesn't) — registered in `ACTION_TOOL_POLICIES` exactly like
+`read_file`/`inspect_workspace`, and implemented the same way those are:
+inline in `action-executor.ts`, no separate catalog-client class. That's a
+real difference from labor-commons' `LocalCatalogService`, not an
+oversight — artifact-commons' `catalog.json` is a flat index (one JSON
+file with a `packs` array), not a tree of per-artifact spec files to walk
+and validate, so there's no scan/sync step to abstract.
+
+Given a query string (the proposal's `targetRef`), it reads
+`{ARTIFACT_COMMONS_ROOT}/catalog.json`, scores each pack by how many
+query terms appear across its id/name/description/artifact_types/tags,
+and returns the top 5 non-zero matches. `ARTIFACT_COMMONS_ROOT` defaults
+to `<repo-root>/../artifact-commons`, matching `OLF_AGENTS_ROOT`'s
+sibling-checkout convention for labor-commons.
+
+Like `delegate_to_child`'s payload living on the run's event log rather
+than the direct `execute()` response, `search_artifacts`' actual match
+list isn't in the `ActionExecutionRecord` either — that only carries a
+flattened `outcome` string. The structured payload is written to the
+action's execution-evidence artifact (`{artifactsRoot}/action-evidence/
+{actionId}/execution-evidence.json`), the same durable-evidence mechanism
+every action tool uses.
+
+If `ARTIFACT_COMMONS_ROOT` isn't checked out (artifact-commons is an
+optional dependency, same reasoning as commons-board's `CB_COMMONS_CREW_URL`
+being optional), the tool doesn't throw — it reports
+`artifact_catalog_unavailable` as a normal, non-error outcome.
+
+**Not done here:** nothing calls this tool automatically before reaching
+for build capability yet — that's the "before build capability, search
+first" sequencing `ARCHITECTURE.md` describes, and it requires a caller
+(a run's own task-loop reasoning, or an external orchestrator) to actually
+decide to propose it. Today it's callable, verified end to end against a
+real artifact-commons checkout (`search-artifacts.test.ts`), but nothing
+proposes it on its own initiative.
+
 ## Open questions (deferred, not v1)
 
 - **Dynamic chair assignment.** Revisit only after the recursive mechanism
