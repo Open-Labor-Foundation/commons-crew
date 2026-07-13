@@ -15,10 +15,14 @@ including a full chair → director → department → worker chain.
 `pa.createChairRun` (see Instance identity) gives commons-crew its own
 side of chair registration, now reachable externally via `POST /api/chairs`
 (`apps/crew-api/src/create-app.ts`) — commons-board's onboarding flow calls
-it to register every chair as a real commons-crew run. Dynamic chair
-assignment is still open (see below); routing a chair's live task execution
-through its own run so `delegate_to_child` chains actually fire is a
-distinct, larger integration also still open (see below).
+it to register every chair as a real commons-crew run.
+`pa.requestDelegationApproval` (see "Requesting delegation approval again",
+below) fixes the one-shot approval limitation that would otherwise have
+made a chair only able to delegate once, ever. Dynamic chair assignment is
+still open (see below); routing a chair's live task execution through its
+own run so `delegate_to_child` chains actually fire — the commons-board
+side of *using* these two primitives together, repeatedly, over a chair's
+lifetime — is a distinct, larger integration also still open (see below).
 
 One correction from the original version of this document, found while
 implementing: there is no autonomous LLM tool-call loop in this codebase.
@@ -100,6 +104,34 @@ cannot delegate further.
 This was a deliberate choice: the action-proposal engine already works
 (propose, approve, execute, with explicit gating on real-world side
 effects). Recursion is a new *tool*, not a new *engine*.
+
+## Requesting delegation approval again: `pa.requestDelegationApproval`
+
+The pending `ApprovalRecord` seeded at chair registration or child creation
+is one-shot by construction: `createProposal` refuses to bind a second,
+different action proposal to an approval that's already bound to one
+(`"the existing approval does not cover this exact tool and target
+surface"`, `packages/core/src/index.ts`). That's correct behavior for an
+approval — it authorizes one specific act, not a standing blank check — but
+it means a long-lived chair run had no way to delegate a *second* time
+after its first `delegate_to_child` executed, which breaks the model for
+any caller (commons-board, dispatching more than one piece of board work to
+an already-registered chair over its lifetime) that expects a chair to keep
+being usable.
+
+`pa.requestDelegationApproval(runId)`, exposed as `POST
+/api/runs/:runId/delegation-approvals`, is the fix: it seeds a fresh
+pending approval on the same run/task, so a caller can request
+authorization again rather than the chair being a use-once primitive.
+Idempotent if a pending approval already exists (returns it instead of
+seeding a duplicate). Rejects runs that aren't part of a delegation chain
+(no `chairRegistration` and no `delegation`) and worker-layer runs (nothing
+below worker to delegate to). Still requires an explicit approval decision
+each time — this does not bypass human oversight, it just makes *asking*
+for delegation capability repeatable instead of one-shot. Verified end to
+end, including the negative case (reusing the old, now-bound approval for a
+second proposal genuinely fails first) in
+`tests/integration/redelegatable-approvals.test.ts`.
 
 ## Chair assignment (v1: fixed, not dynamic)
 

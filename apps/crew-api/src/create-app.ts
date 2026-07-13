@@ -931,6 +931,22 @@ export async function createApiApp(
     return run;
   });
 
+  // Request a fresh delegation approval on an existing chair/director/
+  // department run -- the seeded approval from creation is one-shot (see
+  // requestDelegationApproval in packages/core/src/index.ts), so a caller
+  // dispatching a second piece of work to an already-registered chair needs
+  // this to get delegate_to_child authorized again.
+  app.post("/api/runs/:runId/delegation-approvals", async (request, reply) => {
+    const params = request.params as { runId: string };
+    const result = await services.pa.requestDelegationApproval(params.runId);
+    if ("error" in result) {
+      reply.code(422);
+      return { error: { code: "delegation_approval_request_failed", message: result.error, retryable: false } };
+    }
+    reply.code(201);
+    return result;
+  });
+
   app.get("/api/runs/:runId/tasks", async (request) => {
     const params = request.params as { runId: string };
     return {
