@@ -3813,6 +3813,78 @@ export async function createAppServices(
     return { session, run: created.run };
   }
 
+  /**
+   * The seeded delegation approval a chair (or non-worker delegated child)
+   * gets at creation is one-shot: once it's bound to an executed
+   * delegate_to_child proposal, createProposal's own binding check
+   * ("the existing approval does not cover this exact tool and target
+   * surface") permanently refuses to reuse it for a *different* piece of
+   * work. That's correct -- an approval authorizes one specific act, not a
+   * standing blank check -- but it means a long-lived chair run had no way
+   * to delegate a *second* time. This is the fix: an explicit, callable
+   * request for a fresh pending approval on the same run/task, so an
+   * external caller (commons-board, dispatching a new piece of board work to
+   * an already-registered chair) can request authorization again rather
+   * than the chair being a use-once primitive. Still requires an explicit
+   * approval decision each time -- this does not bypass human oversight, it
+   * just makes asking for it repeatable.
+   */
+  async function requestDelegationApproval(runId: string): Promise<ApprovalRecord | { error: string }> {
+    const state = await store.read();
+    const run = state.runs.find((entry) => entry.id === runId);
+    if (!run) {
+      return { error: `Run "${runId}" was not found.` };
+    }
+
+    const layer = run.delegation?.layer ?? (run.chairRegistration ? "chair" : null);
+    if (!layer) {
+      return { error: "Only a chair or a delegated (director/department) run can request delegation approval; this run is not part of a delegation chain." };
+    }
+    if (layer === "worker") {
+      return { error: "A worker-layer run cannot delegate further." };
+    }
+
+    const runTasks = state.tasks.filter((task) => task.runId === runId);
+    const targetTask = runTasks.find((task) => task.name === "Execute planned work") ?? runTasks[0] ?? null;
+    if (!targetTask) {
+      return { error: "Run has no task to attach a delegation approval to." };
+    }
+
+    const existingPending = state.approvals.find(
+      (approval) => approval.runId === runId && approval.taskId === targetTask.id && approval.status === "pending"
+    );
+    if (existingPending) {
+      return existingPending;
+    }
+
+    const approval: ApprovalRecord = {
+      id: randomUUID(),
+      runId,
+      taskId: targetTask.id,
+      workItemId: run.workItemId,
+      requestedByRuntimeId: "pa-runtime",
+      actionSummary: `Pre-authorization for ${layer} (run ${runId}) to delegate further, requested explicitly.`,
+      impactScope: "real_world",
+      actionProposalId: null,
+      toolId: null,
+      targetRef: null,
+      expiresAt: null,
+      status: "pending",
+      decisionComment: null,
+      requestedAt: now(),
+      decidedAt: null
+    };
+
+    await store.write((current) => ({
+      ...current,
+      approvals: [approval, ...current.approvals]
+    }));
+
+    await appendEvent(runId, "run.delegation_approval_requested", { taskId: targetTask.id, approvalId: approval.id, layer });
+
+    return approval;
+  }
+
   async function createRunFromRequest(
     session: SessionRecord,
     request: RequestRecord,
@@ -4757,6 +4829,14 @@ export async function createAppServices(
      */
     async createChairRun(input: { orgContext: string; chairRole: ChairRole; surface: Surface; title: string }) {
       return await createChairRun(input);
+    },
+
+    /**
+     * Request a fresh delegation approval on an existing chair/director/
+     * department run -- see requestDelegationApproval for why this exists.
+     */
+    async requestDelegationApproval(runId: string) {
+      return await requestDelegationApproval(runId);
     },
 
     async postMessage(sessionId: string, content: string, options: { traceId?: string } = {}) {
