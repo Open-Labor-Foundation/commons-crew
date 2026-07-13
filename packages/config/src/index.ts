@@ -13,6 +13,7 @@ export const ALLOWED_ENV_OVERRIDES = [
   "PA_DATABASE_URL",
   "PA_DATABASE_SCHEMA",
   "OLF_AGENTS_ROOT",
+  "ARTIFACT_COMMONS_ROOT",
   "PA_ARTIFACTS_ROOT",
   "PA_STATE_FILE",
   "PA_BACKUPS_ROOT",
@@ -51,6 +52,7 @@ export type AppConfig = {
   paths: {
     repoRoot: string;
     olfAgentsRoot: string;
+    artifactCommonsRoot: string;
     artifactsRoot: string;
     stateFile: string;
     backupsRoot: string;
@@ -127,6 +129,7 @@ function buildProfileDefaults(profile: ConfigProfileName, repoRoot: string) {
     },
     paths: {
       olfAgentsRoot: path.resolve(repoRoot, "../labor-commons"),
+      artifactCommonsRoot: path.resolve(repoRoot, "../artifact-commons"),
       artifactsRoot: basePaths.artifactsRoot,
       stateFile: basePaths.stateFile,
       backupsRoot: basePaths.backupsRoot
@@ -310,6 +313,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     paths: {
       repoRoot,
       olfAgentsRoot: env.OLF_AGENTS_ROOT ?? defaults.paths.olfAgentsRoot,
+      artifactCommonsRoot: env.ARTIFACT_COMMONS_ROOT ?? defaults.paths.artifactCommonsRoot,
       artifactsRoot: env.PA_ARTIFACTS_ROOT ?? defaults.paths.artifactsRoot,
       stateFile: env.PA_STATE_FILE ?? defaults.paths.stateFile,
       backupsRoot: env.PA_BACKUPS_ROOT ?? defaults.paths.backupsRoot
@@ -402,6 +406,13 @@ export function validateConfig(config: AppConfig): ConfigValidationCheck[] {
       message: isAbsolutePath(config.paths.olfAgentsRoot)
         ? `OLF_AGENTS_ROOT resolved to ${config.paths.olfAgentsRoot}.`
         : "OLF_AGENTS_ROOT must resolve to a non-empty absolute path."
+    },
+    {
+      name: "artifact_commons_root",
+      ok: isAbsolutePath(config.paths.artifactCommonsRoot),
+      message: isAbsolutePath(config.paths.artifactCommonsRoot)
+        ? `ARTIFACT_COMMONS_ROOT resolved to ${config.paths.artifactCommonsRoot}.`
+        : "ARTIFACT_COMMONS_ROOT must resolve to a non-empty absolute path."
     },
     {
       name: "artifacts_root",
