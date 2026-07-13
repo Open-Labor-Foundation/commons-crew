@@ -80,6 +80,9 @@ import {
   TaskRecord,
   TaskExecutionInput,
   TaskExecutionResult,
+  AvailableToolDescriptor,
+  AutonomousToolCall,
+  AutonomousToolResult,
   UserRecord,
   WorkItemCollaborationMessageRecord,
   WorkItemCollaborationThreadRecord,
@@ -811,6 +814,21 @@ async function loadMaterializedSpecialistExecutionContext(
   };
 }
 
+/**
+ * The tools a task's own execution may call on its own initiative,
+ * without any external caller proposing them first -- see
+ * executeTaskWithAutonomousTools. Deliberately just search_artifacts for
+ * now, not every class_a tool (read_file/inspect_workspace are workspace
+ * introspection, not part of the "search before build" sequencing this
+ * exists for); more can be added once this proves out.
+ */
+const AUTONOMOUS_TOOL_DESCRIPTORS: AvailableToolDescriptor[] = [
+  {
+    toolId: "search_artifacts",
+    description: "Search artifact-commons for an existing, previously built solution before building one from scratch. Call this first when the task involves creating something new."
+  }
+];
+
 async function buildTaskExecutionInput(
   state: PersistentState,
   session: SessionRecord,
@@ -865,7 +883,9 @@ async function buildTaskExecutionInput(
       domain: assignedEntry?.manifest.identity.boundary.domain ?? null
     },
     materializedSpecialist,
-    priorCompletedTasks
+    priorCompletedTasks,
+    availableTools: AUTONOMOUS_TOOL_DESCRIPTORS,
+    toolResults: []
   };
 }
 
@@ -3068,6 +3088,106 @@ export async function createAppServices(
     }, activeTask?.id ?? null);
   }
 
+  const MAX_AUTONOMOUS_TOOL_TURNS = 5;
+
+  /**
+   * The actual "reasoning loop" this was missing: unlike every other tool
+   * in this codebase, availableTools' entries can be requested by the
+   * task's own execution instead of by an external caller deciding to
+   * propose them. Still goes through the exact same governed
+   * actions.createProposal / actions.execute path every other tool call
+   * does -- this function is the caller, not a bypass.
+   *
+   * Safety is structural, not a runtime check that could be gotten wrong
+   * under pressure: AUTONOMOUS_TOOL_DESCRIPTORS only ever lists
+   * class_a / requiresApproval:false tools, and the per-call guard below
+   * refuses anything else regardless of what a provider requests, so a
+   * task can never use this path to bypass the human-approval gate a
+   * class_b/c tool would otherwise require through the normal external
+   * action-proposal flow. If that guard ever fires it means
+   * AUTONOMOUS_TOOL_DESCRIPTORS drifted from ACTION_TOOL_POLICIES, not
+   * that a provider asked for something it shouldn't have.
+   *
+   * Backward compatible: a provider that never returns toolCalls (every
+   * provider before this change, and any real provider not doing
+   * function-calling) exits the loop on the first turn with exactly the
+   * result it always returned.
+   */
+  async function executeTaskWithAutonomousTools(
+    initialInput: TaskExecutionInput,
+    runId: string,
+    taskId: string,
+    workItemId: string
+  ): Promise<TaskExecutionResult> {
+    const toolResults: AutonomousToolResult[] = [];
+    let currentInput = initialInput;
+
+    for (let turn = 0; turn < MAX_AUTONOMOUS_TOOL_TURNS; turn++) {
+      const result = await provider.executeTask(currentInput);
+      if (!result.toolCalls || result.toolCalls.length === 0) {
+        return result;
+      }
+
+      for (const call of result.toolCalls) {
+        const policy = getToolPolicy(call.toolId);
+        const isAutonomousSafe = policy && policy.actionClass === "class_a" && !policy.requiresApproval
+          && AUTONOMOUS_TOOL_DESCRIPTORS.some((entry) => entry.toolId === call.toolId);
+
+        if (!isAutonomousSafe) {
+          toolResults.push({
+            toolId: call.toolId,
+            targetRef: call.targetRef,
+            outcome: "rejected_not_autonomous_safe",
+            payload: { reason: `"${call.toolId}" cannot be called autonomously -- only read-only tools with no approval requirement can be. Propose gated actions through the normal external action-proposal flow instead.` }
+          });
+          await appendEvent(runId, "task.autonomous_tool_call_rejected", { taskId, toolId: call.toolId, targetRef: call.targetRef }, taskId);
+          continue;
+        }
+
+        const idempotencyKey = `autonomous-${taskId}-${call.toolId}-turn${turn}-${randomUUID().slice(0, 8)}`;
+        const proposal = await actions.createProposal({
+          workItemId,
+          runId,
+          taskId,
+          toolId: call.toolId,
+          actionClass: policy.actionClass,
+          targetRef: call.targetRef,
+          actionSummary: call.reasoning,
+          idempotencyKey
+        });
+        if ("error" in proposal) {
+          toolResults.push({ toolId: call.toolId, targetRef: call.targetRef, outcome: "proposal_failed", payload: { error: proposal.error.code } });
+          continue;
+        }
+
+        const executed = await actions.execute(proposal.id);
+        if (!executed || "error" in executed) {
+          toolResults.push({ toolId: call.toolId, targetRef: call.targetRef, outcome: "execution_failed", payload: { error: executed && "error" in executed ? executed.error.code : "action_not_found" } });
+          continue;
+        }
+
+        let payload: unknown = null;
+        try {
+          const evidenceRaw = await fs.readFile(actionEvidenceLocation(proposal.id, "execution-evidence.json"), "utf8");
+          payload = (JSON.parse(evidenceRaw) as { execution?: { payload?: unknown } }).execution?.payload ?? null;
+        } catch {
+          // Evidence file missing/unreadable -- the tool still executed
+          // (outcome below reflects that), the provider just gets no
+          // structured payload to reason over on the next turn.
+        }
+
+        toolResults.push({ toolId: call.toolId, targetRef: call.targetRef, outcome: executed.outcome, payload });
+        await appendEvent(runId, "task.autonomous_tool_call_executed", { taskId, toolId: call.toolId, targetRef: call.targetRef, actionId: proposal.id, outcome: executed.outcome }, taskId);
+      }
+
+      currentInput = { ...initialInput, toolResults: [...toolResults] };
+    }
+
+    // Ran out of turns -- ask one final time with no tool access so the
+    // provider is forced to give a real answer instead of looping forever.
+    return provider.executeTask({ ...currentInput, availableTools: [] });
+  }
+
   async function executeRun(runId: string, jobId: string) {
     if (shuttingDown) {
       return;
@@ -3281,12 +3401,22 @@ export async function createAppServices(
     const taskExecutionInput = await buildTaskExecutionInput(state, session, run, nextTask, catalogEntries);
     const taskJob = (async () => {
       const specialistExecutionMode = resolveSpecialistExecutionMode(config, taskExecutionInput);
+      // The autonomous tool loop only exists in the shared_runner path below --
+      // executeTaskInSubprocess/executeTaskInWorkerContainer call the provider
+      // once with no way to consume a toolCalls response. Strip availableTools
+      // (rather than extend the loop across a process boundary) so the model
+      // is never invited to request a tool nothing will act on -- an empty
+      // array is the same "no tools" signal executeTaskWithAutonomousTools
+      // itself uses when it forces a final answer after exhausting its turn cap.
+      const executionInput = specialistExecutionMode === "shared_runner"
+        ? taskExecutionInput
+        : { ...taskExecutionInput, availableTools: [] };
       const executionResult =
         specialistExecutionMode === "worker_container"
-          ? await executeTaskInWorkerContainer(config, taskExecutionInput)
+          ? await executeTaskInWorkerContainer(config, executionInput)
           : specialistExecutionMode === "isolated_subprocess"
-            ? await executeTaskInSubprocess(config, taskExecutionInput)
-            : await provider.executeTask(taskExecutionInput);
+            ? await executeTaskInSubprocess(config, executionInput)
+            : await executeTaskWithAutonomousTools(executionInput, runId, nextTask.id, run.workItemId);
       if (shuttingDown) {
         return;
       }

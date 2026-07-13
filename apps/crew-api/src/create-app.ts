@@ -130,6 +130,27 @@ function createTestPlanDraft(input: PlanDraftInput): PlanDraft {
 }
 
 function createTestTaskExecutionResult(input: TaskExecutionInput): TaskExecutionResult {
+  // Deterministic trigger for exercising the autonomous tool-selection loop
+  // end to end through the real HTTP server, without depending on a live
+  // LLM provider. Scoped to this one phrase so every other test-provider
+  // caller (chairs-http-route, delegation-approvals-http-route, etc.) is
+  // untouched.
+  if (input.task.name === "Execute planned work" && input.run.summary.includes("__AUTONOMOUS_TOOL_TEST__")) {
+    const searchResult = input.toolResults.find((result) => result.toolId === "search_artifacts");
+    if (!searchResult) {
+      return {
+        summary: "",
+        detail: null,
+        toolCalls: [
+          { toolId: "search_artifacts", targetRef: "gig worker cooperative delivery", reasoning: "checking artifact-commons before building anything new" }
+        ]
+      };
+    }
+    const payload = searchResult.payload as { matches?: Array<{ id: string }> } | undefined;
+    const matchId = payload?.matches?.[0]?.id ?? "no-match";
+    return { summary: `Found existing artifact: ${matchId}`, detail: JSON.stringify(searchResult) };
+  }
+
   if (input.specialist.name && input.specialist.domain) {
     if (input.materializedSpecialist) {
       return {
@@ -201,11 +222,15 @@ function createTestProvider(config: AppConfig): ApiProvider {
     authMode: "api_key",
     capabilities: {
       providerIdentity: "Test operator",
-      supportsStreaming: false,
+      // Must match requiredProviderCapabilities in packages/core -- every
+      // other test provider in the repo declares these true. A run dispatched
+      // through this built-in HTTP test provider previously failed closed
+      // with provider_capability_mismatch before any task could execute.
+      supportsStreaming: true,
       supportsStructuredOutputs: true,
-      supportsToolCalls: false,
-      supportsFileIo: false,
-      supportsCancellation: false
+      supportsToolCalls: true,
+      supportsFileIo: true,
+      supportsCancellation: true
     },
     diagnostics: {
       checkedAt: "2026-04-04T00:00:00.000Z",

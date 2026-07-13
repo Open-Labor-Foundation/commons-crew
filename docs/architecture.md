@@ -25,14 +25,22 @@ side of *using* these two primitives together, repeatedly, over a chair's
 lifetime — is a distinct, larger integration also still open (see below).
 
 One correction from the original version of this document, found while
-implementing: there is no autonomous LLM tool-call loop in this codebase.
-The propose → approve → execute action system is HTTP-triggered by an
-external caller (`POST /api/actions/proposals`, then
-`POST /api/actions/:actionId/execute`) — a client decides to propose a
-tool call, the run's own task loop doesn't do it automatically mid-task.
-"Plugging into the existing governed tool-execution loop" means
-`delegate_to_child` is one more entry in that HTTP-driven action-proposal
-system, not a tool the model calls on its own initiative.
+implementing: for `class_b`/`class_c` tools — `delegate_to_child` included —
+there is still no autonomous LLM tool-call loop. The propose → approve →
+execute action system for those stays HTTP-triggered by an external caller
+(`POST /api/actions/proposals`, then `POST /api/actions/:actionId/execute`)
+— a client decides to propose that kind of tool call, and approval still
+runs through `ApprovalRecord`. "Plugging into the existing governed
+tool-execution loop" means `delegate_to_child` is one more entry in that
+HTTP-driven action-proposal system, not a tool the model calls on its own
+initiative.
+
+That said, a real autonomous loop *does* now exist, deliberately scoped to
+tools that were already approval-free by policy — see "Autonomous
+invocation: the 'search first' loop" under Artifact matching, below. A
+task's own execution can call `search_artifacts` mid-task with no external
+caller proposing it; nothing `class_b`/`class_c` is reachable that way, and
+never will be without a separate, explicit decision to widen the allowlist.
 
 ## Instance identity
 
@@ -234,27 +242,121 @@ optional dependency, same reasoning as commons-board's `CB_COMMONS_CREW_URL`
 being optional), the tool doesn't throw — it reports
 `artifact_catalog_unavailable` as a normal, non-error outcome.
 
-**Not done here, and not a simple follow-up:** nothing calls this tool
-automatically before reaching for build capability — that's the "before
-build capability, search first" sequencing `ARCHITECTURE.md` describes.
-This isn't an oversight; it follows directly from the correction already
-noted above (see "Status"): *there is no autonomous LLM tool-call loop in
-this codebase at all.* Every action proposal, including `delegate_to_child`
-itself, is HTTP-triggered by an external caller deciding to propose it —
-nothing in commons-crew currently decides *which* tool to propose based on
-the task's own content. Making "search first" happen automatically would
-mean building that decision-making capability from nothing, not wiring
-`search_artifacts` into an existing loop — a fundamentally different,
-much larger piece of work than adding one more governed tool, and out of
-scope here.
+### Autonomous invocation: the "search first" loop
 
-What exists today: the tool is callable, verified end to end against a
-real artifact-commons checkout (`search-artifacts.test.ts`), and any
-external caller that already decides to propose actions for a run (like
-commons-board's dispatch mechanism) can choose to propose `search_artifacts`
-before proposing a build-capability tool, exactly the way it would choose
-to propose anything else. That's a caller-side sequencing decision, not
-something commons-crew can force from inside.
+A task's own execution now calls `search_artifacts` on its own initiative,
+mid-execution, before giving a final answer — no external caller has to
+propose it. This is the "before build capability, search first" sequencing
+`ARCHITECTURE.md` describes, and it required building a real capability that
+didn't exist anywhere in this codebase before: a task-level tool-call loop.
+Every other action proposal, including `delegate_to_child`, is still
+HTTP-triggered by an external caller deciding to propose it — this is the
+first and only path where the run's own task execution decides *which* tool
+to call based on the task's own content, with no caller in the loop.
+
+**Scope: only reached via the `shared_runner` execution path.**
+`resolveSpecialistExecutionMode` (`packages/core/src/specialist-worker-runtime.ts`)
+picks between three modes per task: `shared_runner` (this loop),
+`isolated_subprocess`, and `worker_container`. The latter two — the default
+for any task with an assigned specialist under the production (`trusted-host`)
+profile — call `provider.executeTask` exactly once, across a process
+boundary (`apps/crew-runner/src/specialist-worker.ts`), with no mechanism to
+consume a second-turn `toolCalls` response. An independent review caught
+that the original version of this change populated `availableTools` on
+every task unconditionally, regardless of which mode would actually run it
+— inviting a real model to request `search_artifacts` on a specialist task
+in production, where nothing would have executed the call or fed back a
+result, leaving an empty `summary` as the recorded outcome. Fixed by
+stripping `availableTools` to `[]` before the subprocess/container paths
+(`executeRun` in `packages/core/src/index.ts`) rather than extending the
+loop across the process boundary — extending it is real future work, not
+attempted here, and until it happens `search_artifacts`' autonomous
+invocation only fires for tasks with no assigned specialist (or any task,
+outside the `trusted-host` profile).
+
+**How it's structurally kept safe.** A task deciding for itself to call a
+tool must never be able to bypass the human-approval gate a `class_b`/`class_c`
+tool would otherwise require through the normal external action-proposal
+flow. Autonomous calls are gated twice, not once:
+
+- `AUTONOMOUS_TOOL_DESCRIPTORS` (`packages/core/src/index.ts`) is the
+  allowlist offered to the provider on every task — currently just
+  `search_artifacts`, deliberately not every `class_a` tool (`read_file`/
+  `inspect_workspace` are workspace introspection, not part of this
+  sequencing, so they stay caller-only).
+- `executeTaskWithAutonomousTools` re-checks every requested `toolId`
+  against the live `ACTION_TOOL_POLICIES` registry before executing
+  anything — `class_a` and `requiresApproval: false` or it's rejected. This
+  is deliberate redundancy: if `AUTONOMOUS_TOOL_DESCRIPTORS` ever drifted
+  from `ACTION_TOOL_POLICIES` (someone adds a tool to the allowlist without
+  checking its policy class), the second gate still holds, not just the
+  first. A rejected call executes nothing, proposes nothing, and is never
+  silently dropped — it appends `task.autonomous_tool_call_rejected` to the
+  run's event log with the toolId, same audit trail as everything else.
+
+**The loop itself.** `buildTaskExecutionInput` hands every task
+`availableTools: AUTONOMOUS_TOOL_DESCRIPTORS` and `toolResults: []`. If the
+provider's `executeTask` response includes non-empty `toolCalls`, the task
+isn't finished: `executeTaskWithAutonomousTools` runs the same
+`createProposal` → `execute` path an external caller would, records
+`task.autonomous_tool_call_executed` (toolId, targetRef, actionId, outcome),
+and calls `executeTask` again with `toolResults` populated from the real
+execution evidence — same evidence-file mechanism described above, not a
+synthesized shortcut. This can repeat up to `MAX_AUTONOMOUS_TOOL_TURNS` (5)
+times; if a task is still requesting tools at the cap, the final call is
+made with `availableTools: []` to force a real answer instead of looping
+forever.
+
+Verified twice, at increasing levels of realism, after finding the first
+pass wasn't actually sufficient evidence:
+
+1. Against a real, separately-running `crew-api` process using its
+   built-in deterministic HTTP test provider: `POST /api/sessions/:id/messages`
+   → runner claim/start → the task requested `search_artifacts` with no
+   external caller involved, the real action executed and wrote a real
+   evidence file under `action-evidence/{actionId}/`. This proved the
+   *loop and gating* work, but not that a real model could ever reach
+   them — an independent audit found `packages/provider-api/src/index.ts`'s
+   `TASK_EXECUTION_SCHEMA` had no `toolCalls` property at all (`additionalProperties: false`
+   made it impossible for a real model to emit one), and separately that
+   the same file's `getStatus()` self-reported `supportsStreaming`/
+   `supportsToolCalls`/`supportsFileIo`/`supportsCancellation` as `false` —
+   which, combined with `requiredProviderCapabilities` in `packages/core`
+   requiring all four `true`, meant **no run had ever been able to execute
+   through the real API-backed provider at all**, a pre-existing defect
+   unrelated to this feature, surfaced while trying to verify it honestly.
+   Both are now fixed: the schema has a real, nullable `toolCalls` array
+   property, the system prompt (`catalog/platform-assistant/spec.yaml`'s
+   `toolUse` section) explains `availableTools`/`toolCalls`/`toolResults`
+   to the model, and `getStatus()`'s capabilities match every other
+   provider in this codebase.
+2. Against that same real, separately-running process, with a real
+   `PA_PROVIDER_API_KEY` and Featherless's `Qwen/Qwen3-32B`, no test double
+   anywhere in the path: the "Analyze request" task's own model call
+   decided, unprompted, to request `search_artifacts` for "gig worker
+   delivery cooperative service catalog," with reasoning text it generated
+   itself ("Need to check artifact-commons for existing reusable solutions
+   before creating new content as requested...") captured in the real
+   evidence file, found the real `gig-cooperative` artifact, and the run's
+   own final task summary explicitly used the result ("Existing 'Gig
+   Worker Cooperative' artifact found in artifact-commons. Applied service
+   catalog configuration pack to workspace."). This is the actual
+   claim this document makes now — not the test-provider pass alone.
+
+`search-artifacts.test.ts` and `autonomous-tool-selection.test.ts` cover
+the loop and gating in-process, including the rejection path for a tool
+that isn't on the safe list — but per the above, an in-process or
+test-provider pass alone is not sufficient evidence that a real model can
+reach the feature; both need checking.
+
+**Still true, and still a caller-side decision, not something removed:**
+this loop only ever offers tools that are safe to run with zero human
+involvement. Any `class_b`/`class_c` tool — `write_file`, `delegate_to_child`
+— stays exactly as gated as it already was: an external caller (a human, or
+commons-board's dispatch mechanism) still has to decide to propose those,
+and approval still runs through the same `ApprovalRecord` flow. Nothing
+about this loop weakens that; it only adds a second, narrower path for the
+specific tools that were already approval-free by policy.
 
 ## Open questions (deferred, not v1)
 

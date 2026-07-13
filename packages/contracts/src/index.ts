@@ -1646,11 +1646,51 @@ export type TaskExecutionInput = {
     name: string;
     summary: string;
   }>;
+  /**
+   * Read-only, no-approval governed tools this task may call on its own
+   * initiative before giving a final answer -- see AutonomousToolCall. Only
+   * class_a / requiresApproval:false tools are ever offered here: a task
+   * deciding for itself to call a tool must never be able to bypass the
+   * human-approval gate a class_b/c tool would otherwise require through
+   * the normal external action-proposal flow.
+   */
+  availableTools: AvailableToolDescriptor[];
+  /** Results from tool calls this task already made earlier in the same execution (see AutonomousToolCall), so a provider that asked for a tool on one turn sees the answer on the next. Empty on the first turn. */
+  toolResults: AutonomousToolResult[];
+};
+
+export type AvailableToolDescriptor = {
+  toolId: string;
+  description: string;
+};
+
+/** A tool call a task's own execution can request instead of giving a final answer -- see TaskExecutionResult.toolCalls. */
+export type AutonomousToolCall = {
+  toolId: string;
+  targetRef: string;
+  /** Why this tool call was made, for the audit trail -- not shown to the model, written to the run's event log. */
+  reasoning: string;
+};
+
+export type AutonomousToolResult = {
+  toolId: string;
+  targetRef: string;
+  outcome: string;
+  payload: unknown;
 };
 
 export type TaskExecutionResult = {
   summary: string;
   detail: string | null;
+  /**
+   * If present and non-empty, this task isn't finished -- these tool calls
+   * should be executed and their results fed back (see
+   * TaskExecutionInput.toolResults) for another turn, instead of treating
+   * summary/detail as the final answer. Omit or leave empty to finish
+   * normally -- every existing provider that doesn't know about this field
+   * behaves exactly as it did before.
+   */
+  toolCalls?: AutonomousToolCall[];
 };
 
 export type RunResultSynthesisInput = {

@@ -106,6 +106,11 @@ platform_prompts:
       - "Use only workspace-relative paths for file operations inside run.workspacePath. Do not target absolute filesystem paths for workspace edits."
       - "Only apply workspace writes when task.approvedForSideEffects is true."
       - "When task.approvedForSideEffects is true, prefer applying the workspace change over handing back an unapplied patch."
+      - "The input may include availableTools: a list of read-only, no-approval tools you can call on your own initiative before giving a final answer, and toolResults: results from calls you already made earlier in this same task (empty on your first turn)."
+      - "To call one of availableTools instead of answering yet, set toolCalls to an array of {toolId, targetRef, reasoning} and leave summary as an empty string and detail as null. You will be called again on the same task with toolResults populated with the real outcome, at which point give your real summary/detail using that result. Set toolCalls to null when giving a final answer."
+      - "Only ever request a toolId that actually appears in availableTools for this call -- never invent one. For search_artifacts, targetRef is a plain-language search query describing what you're looking for."
+      - "If task involves building or configuring something and search_artifacts is listed in availableTools, call it first with a query describing the thing you're about to build, before writing new code or configuration from scratch -- check toolResults first in case you already have an answer from an earlier turn."
+      - "If toolResults already contains a result for the tool you were about to call again, use that result instead of calling it a second time."
 
   finalResult:
     role: "You are the final result synthesis service for commons-crew."
