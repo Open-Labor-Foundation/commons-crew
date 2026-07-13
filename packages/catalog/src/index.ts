@@ -165,21 +165,15 @@ export class LocalCatalogService {
     return this.manifests.get(agentId) ?? null;
   }
 
+  // labor-commons has two overlay axes under catalog/: naics-overlays
+  // (industry-vertical) and function-overlays (generic corporate-function,
+  // added to labor-commons after this scanner was originally written to
+  // find only the first). Both live at the same depth and shape, so both
+  // get scanned the same way.
+  private static readonly OVERLAY_DIR_NAMES = ["naics-overlays", "function-overlays"];
+
   private async findManifestFiles(root: string): Promise<string[]> {
     const results: string[] = [];
-    const agentsRoot = path.join(root, "catalog/naics-overlays");
-
-    try {
-      const stats = await fs.stat(agentsRoot);
-      if (!stats.isDirectory()) {
-        return [];
-      }
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-        return [];
-      }
-      throw error;
-    }
 
     async function visit(current: string) {
       const items = await fs.readdir(current, { withFileTypes: true });
@@ -198,19 +192,22 @@ export class LocalCatalogService {
       }
     }
 
-    try {
-      const agentsRootStatus = await fs.stat(agentsRoot);
-      if (!agentsRootStatus.isDirectory()) {
-        return results;
+    for (const overlayDirName of LocalCatalogService.OVERLAY_DIR_NAMES) {
+      const agentsRoot = path.join(root, "catalog", overlayDirName);
+      try {
+        const stats = await fs.stat(agentsRoot);
+        if (!stats.isDirectory()) {
+          continue;
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+          continue;
+        }
+        throw error;
       }
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-        return results;
-      }
-      throw error;
+      await visit(agentsRoot);
     }
 
-    await visit(agentsRoot);
     return results.sort();
   }
 
