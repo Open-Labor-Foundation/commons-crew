@@ -3401,12 +3401,22 @@ export async function createAppServices(
     const taskExecutionInput = await buildTaskExecutionInput(state, session, run, nextTask, catalogEntries);
     const taskJob = (async () => {
       const specialistExecutionMode = resolveSpecialistExecutionMode(config, taskExecutionInput);
+      // The autonomous tool loop only exists in the shared_runner path below --
+      // executeTaskInSubprocess/executeTaskInWorkerContainer call the provider
+      // once with no way to consume a toolCalls response. Strip availableTools
+      // (rather than extend the loop across a process boundary) so the model
+      // is never invited to request a tool nothing will act on -- an empty
+      // array is the same "no tools" signal executeTaskWithAutonomousTools
+      // itself uses when it forces a final answer after exhausting its turn cap.
+      const executionInput = specialistExecutionMode === "shared_runner"
+        ? taskExecutionInput
+        : { ...taskExecutionInput, availableTools: [] };
       const executionResult =
         specialistExecutionMode === "worker_container"
-          ? await executeTaskInWorkerContainer(config, taskExecutionInput)
+          ? await executeTaskInWorkerContainer(config, executionInput)
           : specialistExecutionMode === "isolated_subprocess"
-            ? await executeTaskInSubprocess(config, taskExecutionInput)
-            : await executeTaskWithAutonomousTools(taskExecutionInput, runId, nextTask.id, run.workItemId);
+            ? await executeTaskInSubprocess(config, executionInput)
+            : await executeTaskWithAutonomousTools(executionInput, runId, nextTask.id, run.workItemId);
       if (shuttingDown) {
         return;
       }

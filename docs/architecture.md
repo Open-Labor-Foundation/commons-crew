@@ -254,6 +254,26 @@ HTTP-triggered by an external caller deciding to propose it — this is the
 first and only path where the run's own task execution decides *which* tool
 to call based on the task's own content, with no caller in the loop.
 
+**Scope: only reached via the `shared_runner` execution path.**
+`resolveSpecialistExecutionMode` (`packages/core/src/specialist-worker-runtime.ts`)
+picks between three modes per task: `shared_runner` (this loop),
+`isolated_subprocess`, and `worker_container`. The latter two — the default
+for any task with an assigned specialist under the production (`trusted-host`)
+profile — call `provider.executeTask` exactly once, across a process
+boundary (`apps/crew-runner/src/specialist-worker.ts`), with no mechanism to
+consume a second-turn `toolCalls` response. An independent review caught
+that the original version of this change populated `availableTools` on
+every task unconditionally, regardless of which mode would actually run it
+— inviting a real model to request `search_artifacts` on a specialist task
+in production, where nothing would have executed the call or fed back a
+result, leaving an empty `summary` as the recorded outcome. Fixed by
+stripping `availableTools` to `[]` before the subprocess/container paths
+(`executeRun` in `packages/core/src/index.ts`) rather than extending the
+loop across the process boundary — extending it is real future work, not
+attempted here, and until it happens `search_artifacts`' autonomous
+invocation only fires for tasks with no assigned specialist (or any task,
+outside the `trusted-host` profile).
+
 **How it's structurally kept safe.** A task deciding for itself to call a
 tool must never be able to bypass the human-approval gate a `class_b`/`class_c`
 tool would otherwise require through the normal external action-proposal
