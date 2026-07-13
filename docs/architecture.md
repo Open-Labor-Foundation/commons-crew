@@ -234,13 +234,27 @@ optional dependency, same reasoning as commons-board's `CB_COMMONS_CREW_URL`
 being optional), the tool doesn't throw — it reports
 `artifact_catalog_unavailable` as a normal, non-error outcome.
 
-**Not done here:** nothing calls this tool automatically before reaching
-for build capability yet — that's the "before build capability, search
-first" sequencing `ARCHITECTURE.md` describes, and it requires a caller
-(a run's own task-loop reasoning, or an external orchestrator) to actually
-decide to propose it. Today it's callable, verified end to end against a
-real artifact-commons checkout (`search-artifacts.test.ts`), but nothing
-proposes it on its own initiative.
+**Not done here, and not a simple follow-up:** nothing calls this tool
+automatically before reaching for build capability — that's the "before
+build capability, search first" sequencing `ARCHITECTURE.md` describes.
+This isn't an oversight; it follows directly from the correction already
+noted above (see "Status"): *there is no autonomous LLM tool-call loop in
+this codebase at all.* Every action proposal, including `delegate_to_child`
+itself, is HTTP-triggered by an external caller deciding to propose it —
+nothing in commons-crew currently decides *which* tool to propose based on
+the task's own content. Making "search first" happen automatically would
+mean building that decision-making capability from nothing, not wiring
+`search_artifacts` into an existing loop — a fundamentally different,
+much larger piece of work than adding one more governed tool, and out of
+scope here.
+
+What exists today: the tool is callable, verified end to end against a
+real artifact-commons checkout (`search-artifacts.test.ts`), and any
+external caller that already decides to propose actions for a run (like
+commons-board's dispatch mechanism) can choose to propose `search_artifacts`
+before proposing a build-capability tool, exactly the way it would choose
+to propose anything else. That's a caller-side sequencing decision, not
+something commons-crew can force from inside.
 
 ## Open questions (deferred, not v1)
 
