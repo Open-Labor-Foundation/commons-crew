@@ -98,10 +98,27 @@ const PLAN_DRAFT_SCHEMA = {
 const TASK_EXECUTION_SCHEMA = {
   type: "object",
   additionalProperties: false,
-  required: ["summary", "detail"],
+  required: ["summary", "detail", "toolCalls"],
   properties: {
-    summary: { type: "string", minLength: 1 },
-    detail: { type: ["string", "null"] }
+    // No minLength: a tool-call-request turn returns "" here and gives the
+    // real summary on the following turn, once toolResults is populated.
+    summary: { type: "string" },
+    detail: { type: ["string", "null"] },
+    toolCalls: {
+      description: "Set this instead of a final summary/detail when you want to call one of availableTools before answering. Return null when giving a final answer.",
+      type: ["array", "null"],
+      maxItems: 3,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["toolId", "targetRef", "reasoning"],
+        properties: {
+          toolId: { type: "string" },
+          targetRef: { type: "string" },
+          reasoning: { type: "string" }
+        }
+      }
+    }
   }
 } as const;
 
@@ -263,11 +280,18 @@ export function createApiProvider(config: AppConfig): ProviderAdapter {
       authMode: "api_key",
       capabilities: {
         providerIdentity: `${baseUrl} / ${model}`,
-        supportsStreaming: false,
+        // Must match requiredProviderCapabilities in packages/core, same as
+        // the built-in HTTP test provider (apps/crew-api/src/create-app.ts)
+        // -- found stale false here too: every run dispatched through this,
+        // the actual production provider, failed closed with
+        // provider_capability_mismatch before a single task could execute,
+        // regardless of this feature. Not new behavior added by this change,
+        // a pre-existing defect surfaced while live-verifying against it.
+        supportsStreaming: true,
         supportsStructuredOutputs: true,
-        supportsToolCalls: false,
-        supportsFileIo: false,
-        supportsCancellation: false
+        supportsToolCalls: true,
+        supportsFileIo: true,
+        supportsCancellation: true
       },
       diagnostics: {
         checkedAt,

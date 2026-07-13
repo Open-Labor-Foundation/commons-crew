@@ -287,14 +287,47 @@ times; if a task is still requesting tools at the cap, the final call is
 made with `availableTools: []` to force a real answer instead of looping
 forever.
 
-Verified against a real, separately-running `crew-api` process (not just
-in-process tests): `POST /api/sessions/:id/messages` → runner claim/start →
-the "Execute planned work" task requested `search_artifacts` with no
-external caller involved, the real action executed and wrote a real
-evidence file under `action-evidence/{actionId}/`, and the task's second
-turn incorporated the real match into its final answer. `search-artifacts.test.ts`
-and `autonomous-tool-selection.test.ts` cover this in-process, including the
-rejection path for a tool that isn't on the safe list.
+Verified twice, at increasing levels of realism, after finding the first
+pass wasn't actually sufficient evidence:
+
+1. Against a real, separately-running `crew-api` process using its
+   built-in deterministic HTTP test provider: `POST /api/sessions/:id/messages`
+   → runner claim/start → the task requested `search_artifacts` with no
+   external caller involved, the real action executed and wrote a real
+   evidence file under `action-evidence/{actionId}/`. This proved the
+   *loop and gating* work, but not that a real model could ever reach
+   them — an independent audit found `packages/provider-api/src/index.ts`'s
+   `TASK_EXECUTION_SCHEMA` had no `toolCalls` property at all (`additionalProperties: false`
+   made it impossible for a real model to emit one), and separately that
+   the same file's `getStatus()` self-reported `supportsStreaming`/
+   `supportsToolCalls`/`supportsFileIo`/`supportsCancellation` as `false` —
+   which, combined with `requiredProviderCapabilities` in `packages/core`
+   requiring all four `true`, meant **no run had ever been able to execute
+   through the real API-backed provider at all**, a pre-existing defect
+   unrelated to this feature, surfaced while trying to verify it honestly.
+   Both are now fixed: the schema has a real, nullable `toolCalls` array
+   property, the system prompt (`catalog/platform-assistant/spec.yaml`'s
+   `toolUse` section) explains `availableTools`/`toolCalls`/`toolResults`
+   to the model, and `getStatus()`'s capabilities match every other
+   provider in this codebase.
+2. Against that same real, separately-running process, with a real
+   `PA_PROVIDER_API_KEY` and Featherless's `Qwen/Qwen3-32B`, no test double
+   anywhere in the path: the "Analyze request" task's own model call
+   decided, unprompted, to request `search_artifacts` for "gig worker
+   delivery cooperative service catalog," with reasoning text it generated
+   itself ("Need to check artifact-commons for existing reusable solutions
+   before creating new content as requested...") captured in the real
+   evidence file, found the real `gig-cooperative` artifact, and the run's
+   own final task summary explicitly used the result ("Existing 'Gig
+   Worker Cooperative' artifact found in artifact-commons. Applied service
+   catalog configuration pack to workspace."). This is the actual
+   claim this document makes now — not the test-provider pass alone.
+
+`search-artifacts.test.ts` and `autonomous-tool-selection.test.ts` cover
+the loop and gating in-process, including the rejection path for a tool
+that isn't on the safe list — but per the above, an in-process or
+test-provider pass alone is not sufficient evidence that a real model can
+reach the feature; both need checking.
 
 **Still true, and still a caller-side decision, not something removed:**
 this loop only ever offers tools that are safe to run with zero human
