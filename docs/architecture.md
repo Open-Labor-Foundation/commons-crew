@@ -418,11 +418,29 @@ specific tools that were already approval-free by policy.
   `proposal.approval.required`, which `createProposal` already sets
   correctly per-proposal.
 
-  **What's still open:** commons-board doesn't call
-  `pa.setOrgAutonomyTier`/the HTTP route yet — no tier has actually been
-  synced from a real deployment, so every org still defaults to `advisor`
-  in practice today. Wiring that sync call is real, separate, scoped work
-  (see commons-board's own docs once that lands).
+  **Fixed:** commons-board now calls the sync route. `syncOrgAutonomyTier`
+  (`services/api/src/lib/commons-crew-client.ts`) PUTs the org's
+  `autonomy_policy.autonomy_mode` (from the interview onboarding flow's own
+  `S5` answers, same `advisor`/`orchestrator`/`autopilot` vocabulary, fail-
+  closed to `advisor` if unanswered) to this endpoint, called once per org
+  in `buildAgentBlueprint` before any of that org's chairs are registered —
+  so a chair's first `delegate_to_child` proposal already reflects the
+  org's real choice rather than commons-crew's default. Non-fatal on any
+  failure, same reasoning as `registerChair`: commons-crew isn't guaranteed
+  deployed alongside every commons-board instance. Verified live against a
+  real running instance of this service (not a test double): registered a
+  chair for an org synced to `orchestrator`, proposed `delegate_to_child`
+  on that chair's run, confirmed `approval.required: false`, executed it,
+  confirmed a real `child_run_delegated` outcome with zero approval
+  decisions — the same behavior the automated integration test asserts,
+  reproduced end to end through commons-board's actual client code.
+
+  **What's still open:** commons-board's separate *launch* onboarding flow
+  (`agent-runtime/launch/generate-artifacts.ts`, distinct from the
+  *interview* flow wired above) sets its own `autonomy_policy` but never
+  calls `registerChair` at all, so it has no commons-crew runs to sync a
+  tier onto — not a gap in this feature, since there's nothing there yet to
+  gate, but worth naming so it isn't mistaken for "also covered."
 - ~~Multi-hop chains beyond one level~~ **Fixed.** `createDelegatedChildRun`
   now seeds a *pending* `ApprovalRecord` on the child's own run/task at
   spawn time for any layer except `worker` — pre-provisioning the
