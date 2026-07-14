@@ -136,6 +136,7 @@ import {
   executeTaskInWorkerContainer,
   resolveSpecialistExecutionMode
 } from "./specialist-worker-runtime";
+import { proposeSpecCorrection } from "./labor-commons-correction";
 
 type EventListener = (event: RunEventRecord) => void;
 type ProviderRunError = {
@@ -311,6 +312,17 @@ const ACTION_TOOL_POLICIES: Record<string, ActionPolicyContract> = {
   idempotencyScope: "run_task",
   requiredPermissions: ["delegation_spawn"],
   evidenceShape: "child_run_reference"
+  },
+  propose_spec_correction: {
+    actionClass: "class_b",
+  readOnly: false,
+  supportsDryRun: false,
+  supportsPreflight: false,
+  supportsRollback: false,
+  requiresApproval: true,
+  idempotencyScope: "run_task",
+  requiredPermissions: ["catalog_write"],
+  evidenceShape: "spec_correction_pr"
   }
 };
 
@@ -864,17 +876,40 @@ async function loadMaterializedSpecialistExecutionContext(
 }
 
 /**
- * The tools a task's own execution may call on its own initiative,
- * without any external caller proposing them first -- see
- * executeTaskWithAutonomousTools. Deliberately just search_artifacts for
- * now, not every class_a tool (read_file/inspect_workspace are workspace
- * introspection, not part of the "search before build" sequencing this
- * exists for); more can be added once this proves out.
+ * The tools a task's own execution may call on its own initiative and have
+ * AUTO-EXECUTED with no human decision in the loop -- see
+ * executeTaskWithAutonomousTools. Restricted by construction to class_a /
+ * requiresApproval:false tools: nothing here can ever have a real-world
+ * side effect a human didn't already, structurally, pre-approve by policy.
+ * Deliberately just search_artifacts for now, not every class_a tool
+ * (read_file/inspect_workspace are workspace introspection, not part of
+ * the "search before build" sequencing this exists for); more can be
+ * added once this proves out.
  */
 const AUTONOMOUS_TOOL_DESCRIPTORS: AvailableToolDescriptor[] = [
   {
     toolId: "search_artifacts",
     description: "Search artifact-commons for an existing, previously built solution before building one from scratch. Call this first when the task involves creating something new."
+  }
+];
+
+/**
+ * The tools a task's own execution may call on its own initiative and have
+ * PROPOSED, but never auto-executed -- a real ApprovalRecord is seeded and
+ * a human decides separately, through the normal external action-proposal
+ * flow, whether it actually runs. This is a distinct, narrower allowlist
+ * from AUTONOMOUS_TOOL_DESCRIPTORS on purpose: proposing something is
+ * inherently safe (it's advisory until a human acts on it), so it doesn't
+ * need the class_a/no-approval restriction that auto-execution does -- but
+ * it's still an explicit, reviewed allowlist, not "any class_b/c tool,"
+ * because a task deciding on its own to create a real, externally visible
+ * artifact (here: a GitHub PR against labor-commons) is a genuinely new
+ * capability class worth naming one tool at a time, not opening broadly.
+ */
+const AUTONOMOUS_PROPOSE_ONLY_TOOL_DESCRIPTORS: AvailableToolDescriptor[] = [
+  {
+    toolId: "propose_spec_correction",
+    description: "Propose a correction to your OWN spec.yaml in labor-commons when you notice it's wrong (a supported task that's missing, an out-of-scope rule that no longer holds, etc.). This only files a PR for human review -- it never merges anything, and you should keep answering the task's actual request either way. targetRef must be a JSON string: {\"manifestId\": <your own catalog entry id, from specialist.id>, \"fieldPath\": [<dot-path into the spec, e.g. \"metadata\", \"specialty_boundary\">], \"proposedValue\": <the corrected value>, \"justification\": <why>}."
   }
 ];
 
@@ -933,7 +968,7 @@ async function buildTaskExecutionInput(
     },
     materializedSpecialist,
     priorCompletedTasks,
-    availableTools: AUTONOMOUS_TOOL_DESCRIPTORS,
+    availableTools: [...AUTONOMOUS_TOOL_DESCRIPTORS, ...AUTONOMOUS_PROPOSE_ONLY_TOOL_DESCRIPTORS],
     toolResults: []
   };
 }
@@ -3148,14 +3183,25 @@ export async function createAppServices(
    * does -- this function is the caller, not a bypass.
    *
    * Safety is structural, not a runtime check that could be gotten wrong
-   * under pressure: AUTONOMOUS_TOOL_DESCRIPTORS only ever lists
-   * class_a / requiresApproval:false tools, and the per-call guard below
-   * refuses anything else regardless of what a provider requests, so a
-   * task can never use this path to bypass the human-approval gate a
-   * class_b/c tool would otherwise require through the normal external
-   * action-proposal flow. If that guard ever fires it means
-   * AUTONOMOUS_TOOL_DESCRIPTORS drifted from ACTION_TOOL_POLICIES, not
-   * that a provider asked for something it shouldn't have.
+   * under pressure, across two distinct tiers:
+   * - AUTONOMOUS_TOOL_DESCRIPTORS (auto-execute): class_a /
+   *   requiresApproval:false only. A task can never use this path to
+   *   bypass the human-approval gate a class_b/c tool would otherwise
+   *   require through the normal external action-proposal flow.
+   * - AUTONOMOUS_PROPOSE_ONLY_TOOL_DESCRIPTORS (propose, never
+   *   auto-execute): the opposite constraint -- requiresApproval must be
+   *   true, and the per-call guard below only ever creates the proposal
+   *   (a real, auditable ApprovalRecord) and stops there; a human still
+   *   decides execution through the normal external flow, identically to
+   *   any other class_b/c tool. This is what makes it safe for a task to
+   *   autonomously create a real, externally visible artifact (a GitHub
+   *   PR against labor-commons, for propose_spec_correction) without a
+   *   human ever having asked for it first -- nothing happens to the
+   *   target of that PR until a human separately approves it.
+   * The per-call guard refuses anything not on either list regardless of
+   * what a provider requests. If it ever fires, that means one of the two
+   * descriptor lists drifted from ACTION_TOOL_POLICIES, not that a
+   * provider asked for something it shouldn't have.
    *
    * Backward compatible: a provider that never returns toolCalls (every
    * provider before this change, and any real provider not doing
@@ -3189,15 +3235,17 @@ export async function createAppServices(
 
       for (const call of result.toolCalls) {
         const policy = getToolPolicy(call.toolId);
-        const isAutonomousSafe = policy && policy.actionClass === "class_a" && !policy.requiresApproval
+        const isAutoExecuteSafe = policy && policy.actionClass === "class_a" && !policy.requiresApproval
           && AUTONOMOUS_TOOL_DESCRIPTORS.some((entry) => entry.toolId === call.toolId);
+        const isProposeOnlySafe = policy && policy.requiresApproval
+          && AUTONOMOUS_PROPOSE_ONLY_TOOL_DESCRIPTORS.some((entry) => entry.toolId === call.toolId);
 
-        if (!isAutonomousSafe) {
+        if (!isAutoExecuteSafe && !isProposeOnlySafe) {
           toolResults.push({
             toolId: call.toolId,
             targetRef: call.targetRef,
             outcome: "rejected_not_autonomous_safe",
-            payload: { reason: `"${call.toolId}" cannot be called autonomously -- only read-only tools with no approval requirement can be. Propose gated actions through the normal external action-proposal flow instead.` }
+            payload: { reason: `"${call.toolId}" cannot be called autonomously -- only tools on AUTONOMOUS_TOOL_DESCRIPTORS (auto-execute) or AUTONOMOUS_PROPOSE_ONLY_TOOL_DESCRIPTORS (propose, human decides execution) can be. Propose other gated actions through the normal external action-proposal flow instead.` }
           });
           await appendEvent(runId, "task.autonomous_tool_call_rejected", { taskId, toolId: call.toolId, targetRef: call.targetRef }, taskId);
           continue;
@@ -3216,6 +3264,23 @@ export async function createAppServices(
         });
         if ("error" in proposal) {
           toolResults.push({ toolId: call.toolId, targetRef: call.targetRef, outcome: "proposal_failed", payload: { error: proposal.error.code } });
+          continue;
+        }
+
+        if (isProposeOnlySafe) {
+          // Deliberately never auto-executed, even though createProposal
+          // succeeded: this tool's policy requires approval, so a real
+          // ApprovalRecord now exists for a human to act on separately,
+          // through the normal external action-proposal flow -- same as
+          // any other class_b/c tool an external caller proposed. The
+          // task keeps running; it does not block waiting for a decision.
+          toolResults.push({
+            toolId: call.toolId,
+            targetRef: call.targetRef,
+            outcome: "proposed_pending_approval",
+            payload: { actionId: proposal.id, approvalRequired: proposal.approval.required }
+          });
+          await appendEvent(runId, "task.autonomous_tool_call_proposed", { taskId, toolId: call.toolId, targetRef: call.targetRef, actionId: proposal.id }, taskId);
           continue;
         }
 
@@ -3901,6 +3966,72 @@ export async function createAppServices(
           layer: result.run.delegation?.layer ?? null,
           scope: proposal.targetRef
         }
+      },
+      rollback: null
+    };
+  }
+
+  /**
+   * commons-crew's own side of practitioner corrections -- see
+   * packages/core/src/labor-commons-correction.ts. targetRef is a JSON
+   * string (same "one free-text field carries the tool's arguments"
+   * convention search_artifacts already uses, since AutonomousToolCall
+   * only ever has a single targetRef string, not structured parameters).
+   */
+  async function executeProposeSpecCorrection(proposal: ActionProposalRecord): Promise<ActionToolExecutionResult> {
+    let parsedInput: { manifestId?: unknown; fieldPath?: unknown; proposedValue?: unknown; justification?: unknown };
+    try {
+      parsedInput = JSON.parse(proposal.targetRef) as typeof parsedInput;
+    } catch {
+      throw new Error("propose_spec_correction's targetRef must be a JSON string with manifestId, fieldPath, proposedValue, and justification.");
+    }
+    if (
+      typeof parsedInput.manifestId !== "string" ||
+      !Array.isArray(parsedInput.fieldPath) ||
+      !parsedInput.fieldPath.every((segment): segment is string => typeof segment === "string") ||
+      typeof parsedInput.proposedValue !== "string" ||
+      typeof parsedInput.justification !== "string"
+    ) {
+      throw new Error("propose_spec_correction's targetRef must include manifestId (string), fieldPath (string[]), proposedValue (string), and justification (string).");
+    }
+
+    const catalogEntries = await ensureCatalog();
+    const result = await proposeSpecCorrection(
+      config,
+      catalogEntries,
+      {
+        manifestId: parsedInput.manifestId,
+        fieldPath: parsedInput.fieldPath,
+        proposedValue: parsedInput.proposedValue,
+        justification: parsedInput.justification
+      },
+      {
+        actionId: proposal.id,
+        runId: proposal.runId,
+        taskId: proposal.taskId
+      }
+    );
+
+    if (!result.ok) {
+      return {
+        actor: "action-tool-executor",
+        dryRun: null,
+        preflight: null,
+        execution: {
+          outcome: "spec_correction_unavailable",
+          payload: { manifestId: parsedInput.manifestId, reason: result.reason }
+        },
+        rollback: null
+      };
+    }
+
+    return {
+      actor: "action-tool-executor",
+      dryRun: null,
+      preflight: null,
+      execution: {
+        outcome: "spec_correction_pr_opened",
+        payload: { manifestId: parsedInput.manifestId, fieldPath: parsedInput.fieldPath, prUrl: result.prUrl, branch: result.branch }
       },
       rollback: null
     };
@@ -6412,12 +6543,50 @@ export async function createAppServices(
         }
       }
 
-      const approvalRecord = effectiveRequiresApproval
+      const proposalId = randomUUID();
+      const approvalExpiry = effectiveRequiresApproval ? new Date(Date.now() + 30 * 60 * 1000).toISOString() : null;
+
+      // propose_spec_correction never reuses another action's approval for
+      // this run/task. Every other requiresApproval:true tool here
+      // (delegate_to_child) deliberately relies on a standing, structurally
+      // pre-seeded authorization (createChairRun / createDelegatedChildRun /
+      // requestDelegationApproval) and *fails closed* -- proposes fine,
+      // execute() refuses -- when none exists; see
+      // tests/integration/delegate-to-child.test.ts's "fail closed" case.
+      // The task's own execution approval (toolId: null, targetRef: null,
+      // used to let the task START) would otherwise satisfy that same
+      // runId+taskId lookup for ANY tool, silently treating "a human let
+      // this task run" as "a human approved filing a labor-commons PR" --
+      // two different decisions a human never actually made the second of.
+      // propose_spec_correction instead gets its own freshly seeded, tool-
+      // and target-scoped ApprovalRecord right here, so there's always
+      // something real for a human to decide on, without ever inheriting
+      // an approval granted for something else.
+      const approvalRecord = effectiveRequiresApproval && input.toolId !== "propose_spec_correction"
         ? state.approvals.find((approval) => approval.runId === input.runId && approval.taskId === input.taskId) ?? null
         : null;
 
-      const proposalId = randomUUID();
-      const approvalExpiry = effectiveRequiresApproval ? new Date(Date.now() + 30 * 60 * 1000).toISOString() : null;
+      const freshApprovalForThisProposal: ApprovalRecord | null =
+        effectiveRequiresApproval && input.toolId === "propose_spec_correction" && input.runId && input.taskId
+          ? {
+              id: randomUUID(),
+              runId: input.runId,
+              taskId: input.taskId,
+              workItemId: input.workItemId,
+              requestedByRuntimeId: "pa-runtime",
+              actionSummary: input.actionSummary ?? `${input.actionClass} ${input.toolId} on ${input.targetRef}`,
+              impactScope: "real_world",
+              actionProposalId: proposalId,
+              toolId: input.toolId,
+              targetRef: input.targetRef,
+              expiresAt: approvalExpiry,
+              status: "pending",
+              decisionComment: null,
+              requestedAt: now(),
+              decidedAt: null
+            }
+          : null;
+      const bindableApprovalRecord = approvalRecord ?? freshApprovalForThisProposal;
 
       if (approvalRecord?.actionProposalId && approvalRecord.actionProposalId !== proposalId) {
         return {
@@ -6520,12 +6689,12 @@ export async function createAppServices(
             input.runId,
             input.taskId,
             true,
-            approvalRecord?.id ?? null,
-            approvalRecord?.status ?? "not_requested",
+            bindableApprovalRecord?.id ?? null,
+            bindableApprovalRecord?.status ?? "not_requested",
             proposalId,
             input.toolId,
             input.targetRef,
-            approvalRecord?.expiresAt ?? approvalExpiry
+            bindableApprovalRecord?.expiresAt ?? approvalExpiry
           )
         : buildApprovalBinding(input.workItemId, input.runId, input.taskId, false);
 
@@ -6601,7 +6770,9 @@ export async function createAppServices(
                   }
                 : approval
             )
-          : current.approvals,
+          : freshApprovalForThisProposal
+            ? [freshApprovalForThisProposal, ...current.approvals]
+            : current.approvals,
         actionProposals: [proposal, ...current.actionProposals]
       }));
       return proposal;
@@ -6655,8 +6826,14 @@ export async function createAppServices(
       // see computeDelegationRequiresApproval) gates this, not a blanket
       // "class_c always needs approval" -- an org-autonomy-tier-approved
       // delegate_to_child proposal has approval.required: false and must
-      // be allowed to execute without a bound approval.
-      if (proposal.actionClass === "class_c" && proposal.approval.required) {
+      // be allowed to execute without a bound approval. Deliberately not
+      // scoped to actionClass === "class_c": every class_a/class_b tool's
+      // static policy has requiresApproval: false (so approval.required is
+      // always false for them here, making this a no-op either way) except
+      // propose_spec_correction (class_b, requiresApproval: true) -- which
+      // needs this exact gate too, or its "human must approve before any
+      // PR opens" guarantee would be unenforced.
+      if (proposal.approval.required) {
         const approvalId = proposal.approval.approvalId;
         const approvedBinding = approvalId
           ? state.approvals.find((approval) => approval.id === approvalId) ?? null
@@ -6815,11 +6992,13 @@ export async function createAppServices(
       try {
         const adapterResult: ActionToolExecutionResult = proposal.toolId === "delegate_to_child"
           ? await executeDelegateToChild(proposal)
-          : await actionExecutor.execute({
-              actionId,
-              proposal,
-              policy: toolPolicy
-            });
+          : proposal.toolId === "propose_spec_correction"
+            ? await executeProposeSpecCorrection(proposal)
+            : await actionExecutor.execute({
+                actionId,
+                proposal,
+                policy: toolPolicy
+              });
         const executedAt = now();
         const dryRunExecutedAt = adapterResult.dryRun ? precheckAt : null;
         const preflightExecutedAt = adapterResult.preflight ? precheckAt : null;

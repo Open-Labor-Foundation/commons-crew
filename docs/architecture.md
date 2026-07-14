@@ -333,17 +333,21 @@ flow. Autonomous calls are gated twice, not once:
   run's event log with the toolId, same audit trail as everything else.
 
 **The loop itself.** `buildTaskExecutionInput` hands every task
-`availableTools: AUTONOMOUS_TOOL_DESCRIPTORS` and `toolResults: []`. If the
-provider's `executeTask` response includes non-empty `toolCalls`, the task
-isn't finished: `executeTaskWithAutonomousTools` runs the same
-`createProposal` → `execute` path an external caller would, records
-`task.autonomous_tool_call_executed` (toolId, targetRef, actionId, outcome),
-and calls `executeTask` again with `toolResults` populated from the real
-execution evidence — same evidence-file mechanism described above, not a
-synthesized shortcut. This can repeat up to `MAX_AUTONOMOUS_TOOL_TURNS` (5)
-times; if a task is still requesting tools at the cap, the final call is
-made with `availableTools: []` to force a real answer instead of looping
-forever.
+`availableTools: [...AUTONOMOUS_TOOL_DESCRIPTORS, ...AUTONOMOUS_PROPOSE_ONLY_TOOL_DESCRIPTORS]`
+and `toolResults: []`. If the provider's `executeTask` response includes
+non-empty `toolCalls`, the task isn't finished: `executeTaskWithAutonomousTools`
+runs the same `createProposal` an external caller would, records
+`task.autonomous_tool_call_executed` (toolId, targetRef, actionId, outcome)
+and calls `execute` too for an `AUTONOMOUS_TOOL_DESCRIPTORS` tool, or stops
+at `createProposal` and records `task.autonomous_tool_call_proposed`
+instead for an `AUTONOMOUS_PROPOSE_ONLY_TOOL_DESCRIPTORS` tool — see
+"Practitioner corrections," below, for why a second tier exists. Either
+way it then calls `executeTask` again with `toolResults` populated from
+the real execution evidence (or the proposal's own id, for a propose-only
+result) — same evidence-file mechanism described above, not a synthesized
+shortcut. This can repeat up to `MAX_AUTONOMOUS_TOOL_TURNS` (5) times; if a
+task is still requesting tools at the cap, the final call is made with
+`availableTools: []` to force a real answer instead of looping forever.
 
 Verified twice, at increasing levels of realism, after finding the first
 pass wasn't actually sufficient evidence:
@@ -388,13 +392,110 @@ test-provider pass alone is not sufficient evidence that a real model can
 reach the feature; both need checking.
 
 **Still true, and still a caller-side decision, not something removed:**
-this loop only ever offers tools that are safe to run with zero human
-involvement. Any `class_b`/`class_c` tool — `write_file`, `delegate_to_child`
-— stays exactly as gated as it already was: an external caller (a human, or
-commons-board's dispatch mechanism) still has to decide to propose those,
-and approval still runs through the same `ApprovalRecord` flow. Nothing
-about this loop weakens that; it only adds a second, narrower path for the
-specific tools that were already approval-free by policy.
+`AUTONOMOUS_TOOL_DESCRIPTORS` only ever offers tools that are safe to run
+with zero human involvement. `write_file`, `delegate_to_child`, and every
+other `class_b`/`class_c` tool not explicitly on one of the two autonomous
+allowlists stays exactly as gated as it already was: an external caller (a
+human, or commons-board's dispatch mechanism) still has to decide to
+propose those, and approval still runs through the same `ApprovalRecord`
+flow. **Correction:** an earlier version of this paragraph said this
+applied to *every* `class_b`/`class_c` tool without exception. That's no
+longer true for one, deliberately: `propose_spec_correction` can now be
+autonomously *proposed* (never executed) — see "Practitioner corrections,"
+below, for the one narrow, reviewed exception and why it doesn't weaken
+the approval gate itself.
+
+## Practitioner corrections: the other half of the gap
+
+`open-labor-foundation/ARCHITECTURE.md` names this as a two-repo gap:
+commons-board's side (a human editing a specialist's record through a UI
+form, opening a real PR) was built first; "commons-crew's own path — a
+specialist correcting its own record mid-conversation, rather than a human
+editing it through commons-board's UI" was the half left open. This closes
+it.
+
+**The mechanism.** `packages/core/src/labor-commons-correction.ts` mirrors
+commons-board's `labor-commons-correction.ts` closely — same ephemeral
+`git worktree` pattern (never touches the shared checkout
+`LocalCatalogService` reads from directly), same `olf-steward[bot]`
+identity, same "opens a PR, never merges" boundary — adapted to this
+repo's own conventions (async `fs` via `./host`, not sync) and its own
+identifier scheme: a `CatalogEntry.id` already *is* the spec's path
+relative to `olfAgentsRoot`, so there's no separate section/agent-slug
+pair to resolve the way commons-board needs one. `propose_spec_correction`
+(`class_b`, `requiresApproval: true`) is a real action tool: `targetRef` is
+a JSON string (`{manifestId, fieldPath, proposedValue, justification}` —
+the same "one free-text field carries the arguments" convention
+`search_artifacts` already established, since `AutonomousToolCall` only
+ever has a single `targetRef` string). Configured via
+`PA_LABOR_COMMONS_GH_TOKEN` (+ `PA_LABOR_COMMONS_REMOTE_URL` /
+`PA_LABOR_COMMONS_GH_API_BASE` test-only overrides) — not configured, not
+deployed with this capability, same non-fatal shape as `search_artifacts`
+against a missing `artifact-commons` checkout (`spec_correction_unavailable`,
+not a thrown error).
+
+**Proposed, never auto-executed — a second, narrower autonomous tier.**
+Unlike `search_artifacts`, this is not a read-only lookup: it creates a
+real, externally visible artifact (a GitHub PR against labor-commons). A
+task deciding entirely on its own to do that — no external caller ever
+asked for it — is a genuinely new capability, not a natural extension of
+the existing "auto-execute only class_a/no-approval tools" rule. Rather
+than widening that rule, `AUTONOMOUS_PROPOSE_ONLY_TOOL_DESCRIPTORS` is a
+second, separate, explicitly-named allowlist:
+`executeTaskWithAutonomousTools` will `createProposal` for a tool on this
+list even though it requires approval, but it never calls `execute` for
+one — the proposal (a real, auditable `ActionProposalRecord` plus a
+pending `ApprovalRecord`) is the outcome, recorded as
+`task.autonomous_tool_call_proposed`, and the task keeps going rather than
+blocking on a decision that isn't its to make. A human still has to decide
+execution, through the exact same external `POST /api/actions/:id/execute`
+flow (after `POST /api/approvals/:id/decision`) any other gated action
+uses. Nothing about proposing bypasses that.
+
+**A real, pre-existing gap this surfaced and fixed, not new behavior added
+for this feature.** `createProposal`'s approval-binding logic reused
+*any* existing `ApprovalRecord` already bound to the same run/task,
+regardless of which tool it was originally requested for — correct and
+deliberate for `delegate_to_child` (a chair's seeded delegation approval,
+or one requested via `pa.requestDelegationApproval`, *is* meant to stand
+as pre-authorization for whatever it delegates), but wrong in general: a
+task's own execution approval (`toolId: null`, `targetRef: null` — seeded
+just to let the task start) would have silently satisfied
+`propose_spec_correction`'s approval requirement too, since the reuse
+lookup only matched on `runId`/`taskId`, never `toolId`. A human approving
+"let this task run" never decided "and also let it file a PR against
+labor-commons." Fixed by scoping the reuse specifically to
+`delegate_to_child` (the only tool this reuse mechanism was ever built or
+tested for — see `tests/integration/delegate-to-child.test.ts`'s "fail
+closed with no approval on record" case, still passing, still fails
+closed exactly as before) and having `createProposal` seed
+`propose_spec_correction` its own fresh, tool-and-target-scoped
+`ApprovalRecord` whenever none already exists for it, so a human always
+has something real, correctly attributed, to decide on — never an
+inherited approval granted for something else. Relatedly, `execute()`'s
+approval gate was hardcoded to `proposal.actionClass === "class_c"` — safe
+by accident until now, since `class_c` (`delegate_to_child`, `deploy`) was
+the only actionClass any tool's static policy ever paired with
+`requiresApproval: true`. Widened to check `proposal.approval.required`
+directly, with no behavior change for any existing tool (every other
+`class_a`/`class_b` tool's static policy is `requiresApproval: false`, so
+the condition was already always false for them and still is).
+
+**Verified end to end, not just in isolation:**
+`tests/unit/labor-commons-correction.test.ts` proves the git/PR mechanism
+itself against a real local bare repo and a local HTTP server standing in
+for GitHub's API (same hermetic pattern commons-board's own test for its
+half of this uses) — real branch pushed, real field changed, rest of the
+document preserved, ephemeral worktree cleaned up, shared checkout
+undisturbed.
+`tests/integration/autonomous-propose-spec-correction.test.ts` drives the
+full path end to end: a task decides on its own to call
+`propose_spec_correction`, the proposal is created with a real pending
+approval bound to it (confirmed `approval.required: true`,
+`approval.status: pending`) and the task finishes without ever calling
+`execute` — confirmed via the event log, not just the return value — then,
+separately, a real human decision (`approvals.decide` + `actions.execute`)
+opens the real PR against the same hermetic git fixture.
 
 ## Open questions (deferred, not v1)
 
