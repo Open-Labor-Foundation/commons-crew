@@ -730,6 +730,25 @@ export type ClarificationThreadView = {
 export type CrewInstanceLayer = "chair" | "director" | "department" | "worker";
 
 /**
+ * Mirrors commons-board's own autonomy mode (advisor/orchestrator/autopilot
+ * — see its autonomy_policy artifact, mode_default field). commons-crew
+ * does not decide this; it's set by the org's own governance process and
+ * synced in from commons-board. Absent for an org that hasn't synced a
+ * tier yet, which is treated the same as "advisor" (fail closed) wherever
+ * it's read — see setOrgAutonomyTier / the delegate_to_child approval
+ * override in packages/core.
+ */
+export type OrgAutonomyTier = "advisor" | "orchestrator" | "autopilot";
+
+export type OrgAutonomyProfileRecord = {
+  /** Equal to orgContext -- the natural unique key here, kept as its own field for consistency with every other PersistentState record (backup/restore relies on a uniform id field). */
+  id: string;
+  orgContext: string;
+  tier: OrgAutonomyTier;
+  updatedAt: string;
+};
+
+/**
  * Present only on a run spawned by delegate_to_child. Absent (null) on a
  * root instance — a chair, or a standalone personal-assistant run with no
  * organizational context. See commons-crew docs/architecture.md.
@@ -2042,6 +2061,7 @@ export type PersistentState = {
   evaluationRuns: EvaluationRunRecord[];
   incidents: IncidentRecord[];
   migrationRecords: MigrationRecord[];
+  orgAutonomyProfiles: OrgAutonomyProfileRecord[];
 };
 
 export const RUNNER_JOB_STATUS_TRANSITIONS: Record<RunnerJobStatus, RunnerJobStatus[]> = {

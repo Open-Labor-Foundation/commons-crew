@@ -39,6 +39,8 @@ import {
   IncidentStatus,
   IntakeCatalogEntry,
   IntakeDecision,
+  OrgAutonomyProfileRecord,
+  OrgAutonomyTier,
   IntakeDecisionInput,
   IntakeSpecialistCandidate,
   MATERIALIZED_SPECIALIST_EXECUTION_CONTRACT_VERSION,
@@ -391,6 +393,52 @@ export function nextLayerDown(layer: CrewInstanceLayer): CrewInstanceLayer | nul
   return DELEGATION_LAYER_ORDER[index + 1];
 }
 
+/** A hard backstop against runaway recursive spawning, independent of autonomy tier -- see computeDelegationRequiresApproval. */
+export const AUTOPILOT_MAX_AUTO_APPROVED_DELEGATIONS_PER_ORG = 20;
+
+/**
+ * Whether a delegate_to_child proposal should require explicit approval,
+ * overriding the tool's static policy (delegate_to_child is class_c,
+ * requiresApproval: true unconditionally in ACTION_TOOL_POLICIES) based on
+ * the org's autonomy tier -- synced in from commons-board, never decided
+ * by commons-crew itself. Scoped to delegate_to_child specifically at the
+ * call site; this function doesn't know or care what tool is asking.
+ *
+ * - advisor: always requires approval (unchanged from the static policy).
+ * - orchestrator: auto-approves delegating to any layer except the final
+ *   hop into "worker" -- reaching the line-level catalog, where a task
+ *   gets real tool access, is the one hop worth a human check, matching
+ *   GOVERNANCE.md's "routine actions execute automatically... anything
+ *   above a defined risk threshold still escalates."
+ * - autopilot: auto-approves every hop, capped by
+ *   AUTOPILOT_MAX_AUTO_APPROVED_DELEGATIONS_PER_ORG existing delegated
+ *   runs for the org -- beyond that, falls back to requiring approval even
+ *   in autopilot, regardless of tier.
+ *
+ * Pure and dependency-free by design, same reasoning as nextLayerDown.
+ */
+export function computeDelegationRequiresApproval(input: {
+  staticRequiresApproval: boolean;
+  parentLayer: CrewInstanceLayer;
+  tier: OrgAutonomyTier;
+  existingDelegatedCountForOrg: number;
+}): boolean {
+  if (input.tier === "advisor") {
+    return input.staticRequiresApproval;
+  }
+
+  if (input.existingDelegatedCountForOrg >= AUTOPILOT_MAX_AUTO_APPROVED_DELEGATIONS_PER_ORG) {
+    return true;
+  }
+
+  if (input.tier === "autopilot") {
+    return false;
+  }
+
+  const targetLayer = nextLayerDown(input.parentLayer);
+  return targetLayer === "worker" || targetLayer === null;
+}
+
 function normalizeContent(content: string) {
   return content.trim().replace(/\s+/g, " ");
 }
@@ -544,7 +592,8 @@ function createDefaultState(): PersistentState {
     runEvents: [],
     evaluationRuns: [],
     incidents: [],
-    migrationRecords: []
+    migrationRecords: [],
+    orgAutonomyProfiles: []
   };
 }
 
@@ -3955,6 +4004,34 @@ export async function createAppServices(
   }
 
   /**
+   * commons-crew never decides an org's autonomy tier itself -- it's set
+   * by the org's own governance process in commons-board and synced in
+   * here so createProposal's delegate_to_child override
+   * (computeDelegationRequiresApproval) has something real to read.
+   * Idempotent upsert, keyed by orgContext. An org with no synced profile
+   * is treated as "advisor" everywhere this is read -- fail closed, not
+   * fail open.
+   */
+  async function setOrgAutonomyTier(input: { orgContext: string; tier: OrgAutonomyTier }): Promise<OrgAutonomyProfileRecord> {
+    const record: OrgAutonomyProfileRecord = {
+      id: input.orgContext,
+      orgContext: input.orgContext,
+      tier: input.tier,
+      updatedAt: now()
+    };
+    await store.write((state) => ({
+      ...state,
+      orgAutonomyProfiles: [record, ...state.orgAutonomyProfiles.filter((profile) => profile.orgContext !== input.orgContext)]
+    }));
+    return record;
+  }
+
+  async function getOrgAutonomyTier(orgContext: string): Promise<OrgAutonomyTier> {
+    const state = await store.read();
+    return state.orgAutonomyProfiles.find((profile) => profile.orgContext === orgContext)?.tier ?? "advisor";
+  }
+
+  /**
    * The seeded delegation approval a chair (or non-worker delegated child)
    * gets at creation is one-shot: once it's bound to an executed
    * delegate_to_child proposal, createProposal's own binding check
@@ -4970,6 +5047,18 @@ export async function createAppServices(
      */
     async createChairRun(input: { orgContext: string; chairRole: ChairRole; surface: Surface; title: string }) {
       return await createChairRun(input);
+    },
+
+    /**
+     * Syncs an org's autonomy tier in from commons-board -- see
+     * setOrgAutonomyTier for why commons-crew doesn't decide this itself.
+     */
+    async setOrgAutonomyTier(input: { orgContext: string; tier: OrgAutonomyTier }) {
+      return await setOrgAutonomyTier(input);
+    },
+
+    async getOrgAutonomyTier(orgContext: string) {
+      return await getOrgAutonomyTier(orgContext);
     },
 
     /**
@@ -6256,7 +6345,28 @@ export async function createAppServices(
         };
       }
 
-      if (toolPolicy.requiresApproval && (!input.runId || !input.taskId)) {
+      const state = await store.read();
+
+      // delegate_to_child's static policy is requiresApproval: true
+      // unconditionally -- this is the org-autonomy-tier override, scoped
+      // to that one tool. Every other tool's approval requirement is
+      // unaffected. See computeDelegationRequiresApproval's own doc
+      // comment for the per-tier behavior.
+      const proposingRun = input.runId ? state.runs.find((run) => run.id === input.runId) : undefined;
+      const proposingOrgContext = proposingRun?.delegation?.orgContext ?? proposingRun?.chairRegistration?.orgContext ?? null;
+      const effectiveRequiresApproval =
+        input.toolId === "delegate_to_child" && proposingOrgContext
+          ? computeDelegationRequiresApproval({
+              staticRequiresApproval: toolPolicy.requiresApproval,
+              parentLayer: proposingRun?.delegation?.layer ?? "chair",
+              tier: state.orgAutonomyProfiles.find((profile) => profile.orgContext === proposingOrgContext)?.tier ?? "advisor",
+              existingDelegatedCountForOrg: state.runs.filter(
+                (run) => run.delegation && run.delegation.orgContext === proposingOrgContext
+              ).length
+            })
+          : toolPolicy.requiresApproval;
+
+      if (effectiveRequiresApproval && (!input.runId || !input.taskId)) {
         return {
           error: {
             code: "approval_required",
@@ -6267,8 +6377,7 @@ export async function createAppServices(
         };
       }
 
-      const state = await store.read();
-      if (toolPolicy.requiresApproval) {
+      if (effectiveRequiresApproval) {
         const deniedBinding = state.approvals.some(
           (approval) =>
             approval.status === "denied" &&
@@ -6287,12 +6396,12 @@ export async function createAppServices(
         }
       }
 
-      const approvalRecord = toolPolicy.requiresApproval
+      const approvalRecord = effectiveRequiresApproval
         ? state.approvals.find((approval) => approval.runId === input.runId && approval.taskId === input.taskId) ?? null
         : null;
 
       const proposalId = randomUUID();
-      const approvalExpiry = toolPolicy.requiresApproval ? new Date(Date.now() + 30 * 60 * 1000).toISOString() : null;
+      const approvalExpiry = effectiveRequiresApproval ? new Date(Date.now() + 30 * 60 * 1000).toISOString() : null;
 
       if (approvalRecord?.actionProposalId && approvalRecord.actionProposalId !== proposalId) {
         return {
@@ -6389,7 +6498,7 @@ export async function createAppServices(
         };
       }
 
-      const proposalApproval = toolPolicy.requiresApproval
+      const proposalApproval = effectiveRequiresApproval
         ? buildApprovalBinding(
             input.workItemId,
             input.runId,
@@ -6464,7 +6573,7 @@ export async function createAppServices(
       });
       await store.write((current) => ({
         ...current,
-        approvals: toolPolicy.requiresApproval && approvalRecord
+        approvals: effectiveRequiresApproval && approvalRecord
           ? current.approvals.map((approval) =>
               approval.id === approvalRecord.id
                 ? {
@@ -6526,7 +6635,12 @@ export async function createAppServices(
         };
       }
 
-      if (proposal.actionClass === "class_c") {
+      // proposal.approval.required (set by createProposal, per-proposal --
+      // see computeDelegationRequiresApproval) gates this, not a blanket
+      // "class_c always needs approval" -- an org-autonomy-tier-approved
+      // delegate_to_child proposal has approval.required: false and must
+      // be allowed to execute without a bound approval.
+      if (proposal.actionClass === "class_c" && proposal.approval.required) {
         const approvalId = proposal.approval.approvalId;
         const approvedBinding = approvalId
           ? state.approvals.find((approval) => approval.id === approvalId) ?? null
