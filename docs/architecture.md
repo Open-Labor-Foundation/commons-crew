@@ -380,14 +380,49 @@ specific tools that were already approval-free by policy.
   autonomy tiers, and `delegate_to_child` capability all now exist for every
   chair from the moment it's created.
 
-- **Routing live task execution through a chair's own run — not yet
-  started.** Registration alone doesn't make delegation happen: a chair's
-  `commons_crew_run_id` currently sits unused once onboarding finishes.
-  Actually dispatching an org's day-to-day work through that run — so
-  `delegate_to_child` chains fire for real and reach the line-level catalog
-  (director → department → worker) — requires deciding how commons-board's
-  task/workflow model maps onto commons-crew's session/message model. That's
-  a distinct, larger integration; this document doesn't specify it yet.
+- ~~Routing live task execution through a chair's own run — not yet
+  started.~~ **Split into two questions that turned out to have different
+  answers.** *Whether a chair's run gets dispatched real work at all* is
+  commons-board's question, answered separately (see
+  `open-labor-foundation/ARCHITECTURE.md`'s commons-board section: a real
+  UI proposes/approves/denies dispatch per board request, opt-in per
+  request via a checkbox). *Whether reaching the line-level catalog
+  (director → department → worker) requires a human to explicitly approve
+  every single hop once dispatch starts* was the part still genuinely
+  unaddressed here, and is now fixed: `delegate_to_child`'s approval
+  requirement is no longer a fixed `true` regardless of context.
+  `computeDelegationRequiresApproval` (`packages/core/src/index.ts`)
+  overrides it per-proposal based on the org's autonomy tier, synced in
+  from commons-board (never decided by commons-crew itself) via
+  `pa.setOrgAutonomyTier` / `PUT /api/orgs/:orgContext/autonomy-tier`,
+  defaulting an org with no synced tier to `advisor` — fail closed, not
+  fail open. `advisor` is unchanged (every hop still gated). `orchestrator`
+  auto-approves every hop except the final one into `worker`, where a task
+  gets real tool access — matching GOVERNANCE.md's "routine actions
+  execute automatically... anything above a defined risk threshold still
+  escalates." `autopilot` auto-approves every hop including into worker,
+  capped by `AUTOPILOT_MAX_AUTO_APPROVED_DELEGATIONS_PER_ORG` (20) existing
+  delegated runs for the org — a hard backstop against runaway recursive
+  spawning independent of tier. Verified end to end, no test double:
+  a real chair → director → department → worker chain executing under
+  `autopilot` with zero approval decisions anywhere in the test
+  (`tests/integration/org-autonomy-tier-delegation.test.ts`), contrasted
+  against the same chain under `advisor`/no-synced-tier still blocking on
+  `approval_required` exactly as before. Caught and fixed a real gap while
+  verifying this against the actual `execute()` path, not just
+  `createProposal`: `execute()`'s class_c gate checked
+  `proposal.actionClass === "class_c"` directly, ignoring whether that
+  *specific* proposal's `approval.required` was actually `true` — an
+  auto-approved proposal would have been correctly created and then
+  immediately rejected by `execute()` regardless. Fixed to check
+  `proposal.approval.required`, which `createProposal` already sets
+  correctly per-proposal.
+
+  **What's still open:** commons-board doesn't call
+  `pa.setOrgAutonomyTier`/the HTTP route yet — no tier has actually been
+  synced from a real deployment, so every org still defaults to `advisor`
+  in practice today. Wiring that sync call is real, separate, scoped work
+  (see commons-board's own docs once that lands).
 - ~~Multi-hop chains beyond one level~~ **Fixed.** `createDelegatedChildRun`
   now seeds a *pending* `ApprovalRecord` on the child's own run/task at
   spawn time for any layer except `worker` — pre-provisioning the

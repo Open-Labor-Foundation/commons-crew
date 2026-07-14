@@ -712,6 +712,28 @@ export async function createApiApp(
     return result;
   });
 
+  // Syncs an org's autonomy tier in from commons-board -- commons-crew
+  // never decides this itself, see pa.setOrgAutonomyTier. Idempotent
+  // upsert; commons-board calls this at chair registration and whenever
+  // the org's tier changes.
+  app.put("/api/orgs/:orgContext/autonomy-tier", async (request, reply) => {
+    const params = request.params as { orgContext: string };
+    const body = (request.body ?? {}) as { tier?: string };
+    if (body.tier !== "advisor" && body.tier !== "orchestrator" && body.tier !== "autopilot") {
+      reply.code(400);
+      return { error: { code: "invalid_autonomy_tier", message: 'tier must be one of "advisor", "orchestrator", "autopilot".', retryable: false } };
+    }
+    const result = await services.pa.setOrgAutonomyTier({ orgContext: params.orgContext, tier: body.tier });
+    reply.code(200);
+    return result;
+  });
+
+  app.get("/api/orgs/:orgContext/autonomy-tier", async (request, reply) => {
+    const params = request.params as { orgContext: string };
+    const tier = await services.pa.getOrgAutonomyTier(params.orgContext);
+    return { orgContext: params.orgContext, tier };
+  });
+
   app.get("/api/sessions/:sessionId", async (request, reply) => {
     const params = request.params as { sessionId: string };
     const session = await services.pa.getSession(params.sessionId);
