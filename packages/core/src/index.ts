@@ -3161,18 +3161,28 @@ export async function createAppServices(
    * provider before this change, and any real provider not doing
    * function-calling) exits the loop on the first turn with exactly the
    * result it always returned.
+   *
+   * `callModel` defaults to the in-process provider (the shared_runner
+   * case), but can be swapped for anything with the same signature --
+   * notably `executeTaskInSubprocess`, which round-trips through a real
+   * child process per turn. The governance (createProposal/execute,
+   * event log, turn cap, the class_a/AUTONOMOUS_TOOL_DESCRIPTORS guard
+   * above) always runs in *this* process regardless of where the model
+   * call itself happens, so isolated_subprocess gets the identical
+   * governed loop, not a reimplementation of it.
    */
   async function executeTaskWithAutonomousTools(
     initialInput: TaskExecutionInput,
     runId: string,
     taskId: string,
-    workItemId: string
+    workItemId: string,
+    callModel: (input: TaskExecutionInput) => Promise<TaskExecutionResult> = (input) => provider.executeTask(input)
   ): Promise<TaskExecutionResult> {
     const toolResults: AutonomousToolResult[] = [];
     let currentInput = initialInput;
 
     for (let turn = 0; turn < MAX_AUTONOMOUS_TOOL_TURNS; turn++) {
-      const result = await provider.executeTask(currentInput);
+      const result = await callModel(currentInput);
       if (!result.toolCalls || result.toolCalls.length === 0) {
         return result;
       }
@@ -3234,7 +3244,7 @@ export async function createAppServices(
 
     // Ran out of turns -- ask one final time with no tool access so the
     // provider is forced to give a real answer instead of looping forever.
-    return provider.executeTask({ ...currentInput, availableTools: [] });
+    return callModel({ ...currentInput, availableTools: [] });
   }
 
   async function executeRun(runId: string, jobId: string) {
@@ -3450,22 +3460,28 @@ export async function createAppServices(
     const taskExecutionInput = await buildTaskExecutionInput(state, session, run, nextTask, catalogEntries);
     const taskJob = (async () => {
       const specialistExecutionMode = resolveSpecialistExecutionMode(config, taskExecutionInput);
-      // The autonomous tool loop only exists in the shared_runner path below --
-      // executeTaskInSubprocess/executeTaskInWorkerContainer call the provider
-      // once with no way to consume a toolCalls response. Strip availableTools
-      // (rather than extend the loop across a process boundary) so the model
-      // is never invited to request a tool nothing will act on -- an empty
-      // array is the same "no tools" signal executeTaskWithAutonomousTools
-      // itself uses when it forces a final answer after exhausting its turn cap.
-      const executionInput = specialistExecutionMode === "shared_runner"
-        ? taskExecutionInput
-        : { ...taskExecutionInput, availableTools: [] };
+      // shared_runner and isolated_subprocess both get the real governed
+      // tool loop (executeTaskWithAutonomousTools) -- only *how the model
+      // gets called* differs (in-process vs. a subprocess round-trip per
+      // turn), not whether the loop runs at all. worker_container is the
+      // one mode that still doesn't reach it: unlike a subprocess, it's a
+      // genuine container boundary with no established callback mechanism
+      // back into this process's actions/store, and porting one is real,
+      // separate, unstarted work -- so availableTools is still stripped
+      // there, for the same "never invite a tool call nothing can act on"
+      // reason as before.
       const executionResult =
         specialistExecutionMode === "worker_container"
-          ? await executeTaskInWorkerContainer(config, executionInput)
+          ? await executeTaskInWorkerContainer(config, { ...taskExecutionInput, availableTools: [] })
           : specialistExecutionMode === "isolated_subprocess"
-            ? await executeTaskInSubprocess(config, executionInput)
-            : await executeTaskWithAutonomousTools(executionInput, runId, nextTask.id, run.workItemId);
+            ? await executeTaskWithAutonomousTools(
+                taskExecutionInput,
+                runId,
+                nextTask.id,
+                run.workItemId,
+                (input) => executeTaskInSubprocess(config, input)
+              )
+            : await executeTaskWithAutonomousTools(taskExecutionInput, runId, nextTask.id, run.workItemId);
       if (shuttingDown) {
         return;
       }

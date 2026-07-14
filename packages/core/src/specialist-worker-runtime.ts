@@ -90,7 +90,7 @@ function buildDockerRunArgs(
   args.push(
     imageId,
     "/app/node_modules/.bin/tsx",
-    "/app/apps/pa-runner/src/specialist-worker.ts",
+    "/app/apps/crew-runner/src/specialist-worker.ts",
     inputPath,
     outputPath
   );
