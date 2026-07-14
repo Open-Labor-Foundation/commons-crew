@@ -22,7 +22,10 @@ export const ALLOWED_ENV_OVERRIDES = [
   "PA_PROVIDER_MODEL",
   "PA_SPECIALIST_EXECUTION_MODE",
   "PA_FEATURE_FLAGS",
-  "PA_API_TOKEN"
+  "PA_API_TOKEN",
+  "PA_LABOR_COMMONS_GH_TOKEN",
+  "PA_LABOR_COMMONS_REMOTE_URL",
+  "PA_LABOR_COMMONS_GH_API_BASE"
 ] as const;
 
 export type ConfigProfileName = (typeof CONFIG_PROFILE_NAMES)[number];
@@ -64,6 +67,11 @@ export type AppConfig = {
   };
   auth: {
     apiToken: string | null;
+  };
+  laborCommons: {
+    ghToken: string | null;
+    remoteUrl: string | null;
+    ghApiBase: string;
   };
   storage: {
     mode: "memory" | "postgres";
@@ -325,6 +333,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     },
     auth: {
       apiToken: env.PA_API_TOKEN ?? null
+    },
+    laborCommons: {
+      ghToken: env.PA_LABOR_COMMONS_GH_TOKEN ?? null,
+      // Override-only (tests point these at a local bare repo / local HTTP
+      // server); production always derives the real GitHub remote from the
+      // token, matching commons-board's identical labor-commons-correction.ts.
+      remoteUrl: env.PA_LABOR_COMMONS_REMOTE_URL ?? null,
+      ghApiBase: env.PA_LABOR_COMMONS_GH_API_BASE ?? "https://api.github.com"
     },
     storage: {
       mode: (
