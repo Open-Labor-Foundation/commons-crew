@@ -254,25 +254,63 @@ HTTP-triggered by an external caller deciding to propose it — this is the
 first and only path where the run's own task execution decides *which* tool
 to call based on the task's own content, with no caller in the loop.
 
-**Scope: only reached via the `shared_runner` execution path.**
+**Scope: now reached via `shared_runner` and `isolated_subprocess` — the
+production default. `worker_container` still isn't.**
 `resolveSpecialistExecutionMode` (`packages/core/src/specialist-worker-runtime.ts`)
-picks between three modes per task: `shared_runner` (this loop),
-`isolated_subprocess`, and `worker_container`. The latter two — the default
-for any task with an assigned specialist under the production (`trusted-host`)
-profile — call `provider.executeTask` exactly once, across a process
-boundary (`apps/crew-runner/src/specialist-worker.ts`), with no mechanism to
-consume a second-turn `toolCalls` response. An independent review caught
-that the original version of this change populated `availableTools` on
-every task unconditionally, regardless of which mode would actually run it
-— inviting a real model to request `search_artifacts` on a specialist task
-in production, where nothing would have executed the call or fed back a
-result, leaving an empty `summary` as the recorded outcome. Fixed by
-stripping `availableTools` to `[]` before the subprocess/container paths
-(`executeRun` in `packages/core/src/index.ts`) rather than extending the
-loop across the process boundary — extending it is real future work, not
-attempted here, and until it happens `search_artifacts`' autonomous
-invocation only fires for tasks with no assigned specialist (or any task,
-outside the `trusted-host` profile).
+picks between three modes per task: `shared_runner`, `isolated_subprocess`,
+and `worker_container`. `isolated_subprocess` is the default for any task
+with an assigned specialist under the production (`trusted-host`) profile —
+i.e. most chair/director/department/worker execution tasks, the common
+case this loop previously never reached at all.
+
+**What changed and why it was safe to extend.** `executeTaskWithAutonomousTools`
+now takes a `callModel` function instead of hardcoding `provider.executeTask`
+— defaulting to the in-process provider call (`shared_runner`), or
+`executeTaskInSubprocess` when the mode is `isolated_subprocess`. The loop,
+the turn cap, the double-gate below, and the audit events are unchanged and
+still run entirely in *this* process; only how the model itself gets called
+differs (an in-process call vs. a real `tsx` child process round trip per
+turn, via the same `executeTaskInSubprocess`/`apps/crew-runner/src/specialist-worker.ts`
+mechanism a single-shot task already used). `specialist-worker.ts` itself
+needed zero changes — it already round-trips whatever `TaskExecutionInput`
+it's given (including `availableTools`/`toolResults`) through
+`provider.executeTask` and writes back the full `TaskExecutionResult`
+(including `toolCalls`), so it was already a correct single-turn primitive;
+the fix was making the governed loop call that primitive repeatedly instead
+of once, with tool execution and approval logic staying where the
+governance state already lives (the parent process), never crossing into
+the child. This means each turn under `isolated_subprocess` re-spawns a
+process — more overhead than the in-process loop, but correct, and no
+worse than the isolation model this mode already committed to per task.
+
+`worker_container` still doesn't reach the loop: unlike a subprocess, it's
+a genuine container boundary (`docker run`) with no established callback
+path back into this process's `actions`/`store`, and it's never a profile
+default (only reachable via an explicit `PA_SPECIALIST_EXECUTION_MODE`
+override) — porting the loop there is real, separate, unstarted work.
+`availableTools` is still stripped to `[]` before that path for the same
+reason as before: never invite a tool call nothing can act on. (Incidental
+fix while touching this file: `worker_container`'s in-container script path
+was stale — `/app/apps/pa-runner/src/specialist-worker.ts`, a directory
+that doesn't exist in this repo — corrected to `/app/apps/crew-runner/...`;
+found while reading the code for this change, unrelated to the loop itself,
+and still untested since this mode has no test coverage and is never a
+default.)
+
+Verified with a real child process, not an in-process stand-in:
+`tests/integration/autonomous-tool-selection-isolated-subprocess.test.ts`
+forces a real catalog fixture (so the task gets an actual assigned
+specialist, not the null-specialist case that always stays on
+`shared_runner`) and `PA_SPECIALIST_EXECUTION_MODE=isolated_subprocess`,
+then points `PA_PROVIDER_BASE_URL` at a local fake HTTP server — the real,
+unmodified `apps/crew-runner/src/specialist-worker.ts` is what calls it,
+via the real `createApiProvider`, in a real spawned `tsx` process. The
+in-process test provider is wired to throw if it's ever called for the
+task under test, so the test fails loudly rather than silently passing on
+the wrong code path. Confirms `task.autonomous_tool_call_executed` fires
+and the task's final result incorporates the real search result, exactly
+like the existing `shared_runner` test
+(`tests/integration/autonomous-tool-selection.test.ts`).
 
 **How it's structurally kept safe.** A task deciding for itself to call a
 tool must never be able to bypass the human-approval gate a `class_b`/`class_c`
