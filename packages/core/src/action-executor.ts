@@ -223,6 +223,64 @@ export function createDefaultActionToolExecutor(config: AppConfig): ActionToolEx
         };
       }
 
+      if (proposal.toolId === "publish_artifact") {
+        // Copies a workspace file into the run's artifact store so it can be
+        // listed and downloaded by the requesting surface. The toolPayload
+        // carries artifact_type and name alongside the path (in targetRef).
+        const payload = (proposal.toolPayload ?? {}) as { artifact_type?: string; name?: string };
+        const sourcePath = path.join(workspaceRoot, sanitizeRelativePath(proposal.targetRef));
+        const artifactType = typeof payload.artifact_type === "string" && payload.artifact_type.trim() ? payload.artifact_type.trim() : "file";
+        const artifactName = typeof payload.name === "string" && payload.name.trim() ? payload.name.trim() : proposal.targetRef;
+
+        const sourceExists = await pathExists(sourcePath);
+        if (!sourceExists) {
+          return {
+            actor,
+            dryRun: null,
+            preflight: null,
+            execution: { outcome: "publish_failed", payload: { sourcePath, reason: "source file not found" } },
+            rollback: null
+          };
+        }
+
+        // Read the source file and copy it into the artifacts root under a
+        // published-artifacts subdirectory. The actionId provides uniqueness.
+        const publishedDir = path.join(config.paths.artifactsRoot, "published-artifacts", actionId);
+        await fs.mkdir(publishedDir, { recursive: true });
+        const fileName = path.basename(sourcePath);
+        const destPath = path.join(publishedDir, fileName);
+        const content = await fs.readFile(sourcePath);
+        await fs.writeFile(destPath, content);
+
+        return {
+          actor,
+          dryRun: policy.supportsDryRun
+            ? {
+                outcome: "publish_prepared",
+                payload: {
+                  sourcePath,
+                  destPath,
+                  artifactType,
+                  artifactName,
+                  sizeBytes: content.length
+                }
+              }
+            : null,
+          preflight: null,
+          execution: {
+            outcome: "artifact_published",
+            payload: {
+              sourcePath,
+              destPath,
+              artifactType,
+              artifactName,
+              sizeBytes: content.length
+            }
+          },
+          rollback: null
+        };
+      }
+
       if (proposal.toolId === "run_command") {
         // The command string is carried in targetRef. This is the runtime's
         // governed execution capability (class_c, approval-gated). It runs in the

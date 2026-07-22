@@ -336,6 +336,17 @@ const ACTION_TOOL_POLICIES: Record<string, ActionPolicyContract> = {
   idempotencyScope: "run_task",
   requiredPermissions: ["command_execution"],
   evidenceShape: "command_output"
+  },
+  publish_artifact: {
+    actionClass: "class_b",
+  readOnly: false,
+  supportsDryRun: true,
+  supportsPreflight: true,
+  supportsRollback: false,
+  requiresApproval: false,
+  idempotencyScope: "run_task",
+  requiredPermissions: ["workspace_write"],
+  evidenceShape: "published_artifact"
   }
 };
 
@@ -3210,6 +3221,19 @@ export async function createAppServices(
         }
       });
     }
+    defs.push({
+      name: "publish_artifact",
+      description: "Publish a workspace file as a named deliverable artifact. Copies the file into the run's artifact store and records it so it can be listed and downloaded by the requesting surface. Use this when a task produces a concrete deliverable (a built application, a generated document, a config file, etc.) that needs to be handed back to the user.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Relative path to the workspace file to publish." },
+          artifact_type: { type: "string", description: "A short type label for the artifact, e.g. 'application', 'document', 'config', 'report'." },
+          name: { type: "string", description: "A human-readable name for the published artifact." }
+        },
+        required: ["path", "artifact_type", "name"]
+      }
+    });
     return defs;
   }
 
@@ -3355,6 +3379,7 @@ export async function createAppServices(
         ? "run_command is available for this task; use it for builds, tests, and other executions."
         : "run_command is NOT available for this task. Do all work with file reads/writes and do not rely on executing commands.",
       "Every tool call is governed and recorded as evidence. Make real, minimal, correct changes.",
+      "When the task produces a concrete deliverable (a built application, a generated document, a config file, etc.), use publish_artifact to publish it so the requesting surface can list and download it.",
       "When the task is fully complete, reply with a final plain-text message (and NO tool calls) that summarizes exactly what you changed."
     ]
       .filter(Boolean)
@@ -3378,7 +3403,7 @@ export async function createAppServices(
     let finalText: string | null = null;
     let mutatingActionsCount = 0;
     const maxSteps = config.runtime.maxToolSteps ?? 24;
-    const MUTATING_TOOLS = new Set(["write_file", "edit_file", "run_command"]);
+    const MUTATING_TOOLS = new Set(["write_file", "edit_file", "run_command", "publish_artifact"]);
     // "Execute planned work" and delegated "Specialist contribution: ..." tasks
     // are where the actual implementation is supposed to happen — unlike
     // "Analyze request" or "Summarize outcome", which are legitimately
@@ -5512,6 +5537,31 @@ export async function createAppServices(
       return state.runEvents.filter((event) => event.runId === runId);
     },
 
+    async artifacts(runId: string): Promise<ArtifactRecord[]> {
+      const state = await store.read();
+      return state.artifacts.filter((artifact) => artifact.runId === runId);
+    },
+
+    async publishedArtifacts(runId: string): Promise<ArtifactRecord[]> {
+      const state = await store.read();
+      return state.artifacts.filter(
+        (artifact) => artifact.runId === runId && artifact.artifactType === "published_artifact"
+      );
+    },
+
+    async artifactPath(artifactId: string): Promise<string | null> {
+      const state = await store.read();
+      const artifact = state.artifacts.find((entry) => entry.id === artifactId) ?? null;
+      if (!artifact) return null;
+      // Verify the file exists on disk before returning the path.
+      try {
+        await fs.access(artifact.storagePath);
+        return artifact.storagePath;
+      } catch {
+        return null;
+      }
+    },
+
     async replayEvents(runId: string) {
       const state = await store.read();
       const run = state.runs.find((entry) => entry.id === runId) ?? null;
@@ -6714,6 +6764,22 @@ export async function createAppServices(
           outcome: `${adapterResult.execution.outcome}: ${proposal.toolId} -> ${proposal.targetRef}`
         };
 
+        const publishedArtifactRecord =
+          proposal.runId &&
+          proposal.toolId === "publish_artifact" &&
+          adapterResult.execution.outcome === "artifact_published"
+            ? (() => {
+                const execPayload = adapterResult.execution.payload as { destPath?: string; artifactType?: string; artifactName?: string };
+                return createArtifactRecord(
+                  proposal.runId,
+                  proposal.taskId,
+                  "published_artifact",
+                  execPayload.destPath ?? evidencePath,
+                  execPayload.artifactName ?? `Published artifact: ${proposal.targetRef}`
+                );
+              })()
+            : null;
+
         const artifactRecords = proposal.runId
           ? [
               createArtifactRecord(
@@ -6723,6 +6789,7 @@ export async function createAppServices(
                 evidencePath,
                 `Execution evidence for ${proposal.toolId} on ${proposal.targetRef}.`
               ),
+              ...(publishedArtifactRecord ? [publishedArtifactRecord] : []),
               ...(dryRunRef
                 ? [
                     createArtifactRecord(

@@ -1,4 +1,6 @@
 import { timingSafeEqual } from "node:crypto";
+import { createReadStream } from "node:fs";
+import path from "node:path";
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import { createAppServices } from "../../../packages/core/src/index";
@@ -939,6 +941,39 @@ export async function createApiApp(
       },
       events
     };
+  });
+
+  app.get("/api/runs/:runId/artifacts", async (request, reply) => {
+    const params = request.params as { runId: string };
+    const run = await services.runs.get(params.runId);
+    if (!run) {
+      reply.code(404);
+      return notFound("run_not_found", "Run was not found.");
+    }
+    const artifacts = await services.runs.artifacts(params.runId);
+    return { artifacts };
+  });
+
+  app.get("/api/runs/:runId/artifacts/published", async (request, reply) => {
+    const params = request.params as { runId: string };
+    const run = await services.runs.get(params.runId);
+    if (!run) {
+      reply.code(404);
+      return notFound("run_not_found", "Run was not found.");
+    }
+    const artifacts = await services.runs.publishedArtifacts(params.runId);
+    return { artifacts };
+  });
+
+  app.get("/api/artifacts/:artifactId/download", async (request, reply) => {
+    const params = request.params as { artifactId: string };
+    const filePath = await services.runs.artifactPath(params.artifactId);
+    if (!filePath) {
+      reply.code(404);
+      return notFound("artifact_not_found", "Artifact was not found or its file is missing.");
+    }
+    reply.header("Content-Disposition", `attachment; filename="${path.basename(filePath)}"`);
+    return reply.send(createReadStream(filePath));
   });
 
   app.get("/api/incidents", async (request) => {
