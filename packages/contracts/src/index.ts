@@ -811,6 +811,8 @@ export type TaskRecord = {
   approvalRequired: boolean;
   resultSummary?: string | null;
   resultDetail?: string | null;
+  /** Count of write_file/edit_file/run_command calls that actually succeeded, so downstream synthesis can tell a real implementation step from an inspection-only one. */
+  resultMutatingActionsCount?: number;
   startedAt: string | null;
   endedAt: string | null;
 };
@@ -1628,6 +1630,8 @@ export type TaskExecutionInput = {
 export type TaskExecutionResult = {
   summary: string;
   detail: string | null;
+  /** Count of write_file/edit_file/run_command calls that actually succeeded during this task. Lets downstream synthesis distinguish real progress from a plausible-sounding summary of an inspection-only task. */
+  mutatingActionsCount: number;
 };
 
 export type RunResultSynthesisInput = {
@@ -1649,6 +1653,7 @@ export type RunResultSynthesisInput = {
     assignedAgentDomain: string | null;
     summary: string;
     detail: string | null;
+    mutatingActionsCount: number;
   }>;
   delegationDecisions: Array<{
     specialistName: string | null;
@@ -1745,9 +1750,28 @@ export type ToolStepInput = {
   messages: ProviderToolLoopMessage[];
   tools: ProviderToolDefinition[];
 };
+export type ToolStepUsage = {
+  model: string;
+  promptTokens: number;
+  completionTokens: number;
+};
 export type ToolStepResult = {
   content: string | null;
   toolCalls: ProviderToolCall[];
+  usage?: ToolStepUsage;
+};
+
+// One entry from the provider's live model catalog (e.g. Featherless
+// GET /v1/models). Providers that can't enumerate models (test/evaluation
+// doubles) simply don't implement listModels.
+export type ModelCatalogEntry = {
+  id: string;
+  contextLength: number;
+  supportsToolCalling: boolean;
+  /** Provider-defined resource cost per concurrent request on this model (e.g. Featherless's concurrency_cost). Not a dollar figure. */
+  concurrencyCost: number | null;
+  availableOnPlan: boolean;
+  maxCompletionTokens: number | null;
 };
 
 export type ProviderAdapter = {
@@ -1756,6 +1780,8 @@ export type ProviderAdapter = {
   decideIntake: (input: IntakeDecisionInput) => Promise<IntakeDecision>;
   answerChat: (input: ChatAnswerInput) => Promise<ChatAnswer>;
   createPlan: (input: PlanDraftInput) => Promise<PlanDraft>;
+  /** The provider's live model catalog, when it can enumerate one. */
+  listModels?: () => Promise<ModelCatalogEntry[]>;
   executeTask: (input: TaskExecutionInput) => Promise<TaskExecutionResult>;
   proposeToolCalls: (input: ToolStepInput) => Promise<ToolStepResult>;
   synthesizeRunResult: (input: RunResultSynthesisInput) => Promise<RunResultSynthesisResult>;

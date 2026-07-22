@@ -15,8 +15,23 @@ function copyGovernance() {
   console.log(`copied governance/ (${fs.readdirSync(path.join(to, "prompts")).length} prompt files)`);
 }
 
+// The provider's platform-assistant spec (packages/provider-api reads
+// {repoRoot}/catalog/platform-assistant/spec.yaml for its own governed
+// prompts) — a different thing from the labor-commons materialization
+// catalog. repoRoot is pinned to this extension's install dir, so the file
+// has to be bundled here too or intake decisioning has nothing to read.
+function copyPlatformAssistantSpec() {
+  const from = path.resolve(__dirname, "../../catalog/platform-assistant");
+  const to = path.resolve(__dirname, "catalog/platform-assistant");
+  fs.rmSync(to, { recursive: true, force: true });
+  fs.mkdirSync(path.dirname(to), { recursive: true });
+  fs.cpSync(from, to, { recursive: true });
+  console.log("copied catalog/platform-assistant/spec.yaml");
+}
+
 async function main() {
   copyGovernance();
+  copyPlatformAssistantSpec();
   const ctx = await esbuild.context({
     entryPoints: ["src/extension.ts"],
     bundle: true,

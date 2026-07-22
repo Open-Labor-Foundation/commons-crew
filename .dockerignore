@@ -1,9 +1,28 @@
-**/node_modules
+# Exclude files not needed in the Docker build context.
+# This keeps the build fast and the context small.
+
+# Dependencies (reinstalled by npm ci in the Dockerfile)
+node_modules
+apps/*/node_modules
+packages/*/node_modules
+
+# Runtime state (can be 100K+ lines — massive and not needed at build time)
 .data
+
+# Git history
 .git
-**/dist
-**/*.log
-npm-debug.log*
+
+# VSCode extension build artifacts
+apps/crew-vscode/dist
+apps/crew-vscode/.vscode
+apps/crew-vscode/node_modules
+
+# Docker artifacts (not needed inside the image)
+infra/docker/.env
+infra/docker/.env.example
+
+# IDE and misc
+*.log
 .DS_Store
-infra/docker
-apps/crew-vscode
+.vscode
+.idea

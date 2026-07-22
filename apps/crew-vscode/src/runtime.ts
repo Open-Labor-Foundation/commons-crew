@@ -28,8 +28,12 @@ export interface RuntimeOptions {
   apiKey: string;
   baseUrl: string;
   model: string;
+  fallbackModels?: string[];
   catalogRef: string;
   catalogRepoUrl?: string;
+  maxConcurrentLanes?: number;
+  /** Maximum tool-loop iterations per task (maps to PA_MAX_TOOL_STEPS). */
+  maxToolSteps?: number;
 }
 
 export interface EmbeddedRuntime {
@@ -54,6 +58,9 @@ export async function createEmbeddedRuntime(options: RuntimeOptions): Promise<Em
     PA_PROVIDER_API_KEY: options.apiKey,
     PA_PROVIDER_BASE_URL: options.baseUrl,
     PA_PROVIDER_MODEL: options.model,
+    PA_PROVIDER_FALLBACK_MODELS: (options.fallbackModels ?? []).join(","),
+    PA_MAX_CONCURRENT_RUNS: String(options.maxConcurrentLanes ?? 4),
+    PA_MAX_TOOL_STEPS: String(options.maxToolSteps ?? 40),
     OLF_AGENTS_ROOT: catalogDir,
     PA_WORKSPACE_ROOT: options.workspaceRoot,
     PA_ARTIFACTS_ROOT: path.join(options.storageRoot, "artifacts"),

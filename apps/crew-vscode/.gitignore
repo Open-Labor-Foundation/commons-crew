@@ -5,3 +5,6 @@ package-lock.json
 # governance/ is copied from ../../governance at build time (packaged into the
 # vsix, never committed here).
 governance/
+# catalog/platform-assistant/ is copied from ../../catalog/platform-assistant
+# at build time, same reason.
+catalog/

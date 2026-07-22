@@ -21,6 +21,8 @@ export const ALLOWED_ENV_OVERRIDES = [
   "PA_PROVIDER_BASE_URL",
   "PA_PROVIDER_MODEL",
   "PA_PROVIDER_FALLBACK_MODELS",
+  "PA_MAX_CONCURRENT_RUNS",
+  "PA_MAX_TOOL_STEPS",
   "PA_SPECIALIST_EXECUTION_MODE",
   "PA_FEATURE_FLAGS",
   "PA_API_TOKEN"
@@ -69,6 +71,17 @@ export type AppConfig = {
     // Ordered fallback models tried when the primary model returns a transient
     // error (busy / overloaded / 429 / 5xx). Empty by default.
     fallbackModels: string[];
+  };
+  runtime: {
+    // Ceiling on how many runs this process executes at once. A soft,
+    // user-configurable safety valve — not a fixed platform constant. See
+    // AUTONOMOUS_BUDGET_POLICY.concurrencyCeiling for the (separate) per-run
+    // task/subagent budget.
+    maxConcurrentRuns: number;
+    // Maximum tool-loop iterations per task before the runtime stops and
+    // reports the task as completed-without-conclusion. Prevents a model
+    // from looping indefinitely on a single task. Default 24.
+    maxToolSteps: number;
   };
   auth: {
     apiToken: string | null;
@@ -258,6 +271,11 @@ function parsePort(value: string | undefined, fallback: number) {
   return value === undefined ? fallback : Number(value);
 }
 
+function parsePositiveInt(value: string | undefined, fallback: number) {
+  const parsed = value === undefined ? NaN : Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
+
 function isAbsolutePath(value: string) {
   return Boolean(value) && path.isAbsolute(value);
 }
@@ -344,6 +362,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
         .split(",")
         .map((entry) => entry.trim())
         .filter(Boolean)
+    },
+    runtime: {
+      maxConcurrentRuns: parsePositiveInt(env.PA_MAX_CONCURRENT_RUNS, 4),
+      maxToolSteps: parsePositiveInt(env.PA_MAX_TOOL_STEPS, 24)
     },
     auth: {
       apiToken: env.PA_API_TOKEN ?? null

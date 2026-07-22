@@ -8,9 +8,9 @@
 import type { CrewServices } from "./runtime";
 
 export type DriveOutcome =
-  | { kind: "chat"; text: string }
-  | { kind: "clarification"; text: string }
-  | { kind: "run"; runId: string; status: string; text: string };
+  | { kind: "chat"; sessionId: string; text: string }
+  | { kind: "clarification"; sessionId: string; text: string }
+  | { kind: "run"; sessionId: string; runId: string; status: string; text: string };
 
 export interface RunEvent {
   id: string;
@@ -34,6 +34,8 @@ export interface DriveHandlers {
   /** Return "approved" or "denied" for a pending class_c approval. */
   onApproval?(approval: ApprovalAsk): Promise<"approved" | "denied">;
   onStatus?(status: string): void | Promise<void>;
+  /** Fired once a run is created, before the polling loop starts — lets a host offer a Stop control immediately. */
+  onRunStarted?(runId: string): void;
 }
 
 export interface DriveOptions {
@@ -41,6 +43,10 @@ export interface DriveOptions {
   runnerId?: string;
   pollMs?: number;
   timeoutMs?: number;
+  /** Continue this existing session (multi-turn chat). If absent, a new one is created. */
+  sessionId?: string;
+  /** Title used when a new session is created. */
+  sessionTitle?: string;
 }
 
 const TERMINAL = new Set(["completed", "failed", "cancelled"]);
@@ -62,7 +68,6 @@ async function pump(services: CrewServices, runnerId: string): Promise<void> {
 
 export async function driveRequest(
   services: CrewServices,
-  sessionTitle: string,
   prompt: string,
   handlers: DriveHandlers = {},
   options: DriveOptions = {}
@@ -72,10 +77,12 @@ export async function driveRequest(
   const pollMs = options.pollMs ?? 400;
   const timeoutMs = options.timeoutMs ?? 15 * 60 * 1000;
 
-  const session = await services.pa.createSession("cli", sessionTitle);
-  const view = await services.pa.postMessage(session.session.id, prompt);
+  // Continue an existing chat session, or open a new one.
+  const sessionId = options.sessionId
+    ?? (await services.pa.createSession("cli", options.sessionTitle ?? (prompt.slice(0, 80) || "commons-crew chat"))).session.id;
+  const view = await services.pa.postMessage(sessionId, prompt);
   if (!view) {
-    return { kind: "chat", text: "The runtime could not open a session for this request." };
+    return { kind: "chat", sessionId, text: "The runtime could not continue this session." };
   }
 
   const lastMessageText = () => {
@@ -85,12 +92,13 @@ export async function driveRequest(
 
   if (!view.latestRun) {
     if ((view.pendingClarifications?.length ?? 0) > 0) {
-      return { kind: "clarification", text: lastMessageText() };
+      return { kind: "clarification", sessionId, text: lastMessageText() };
     }
-    return { kind: "chat", text: lastMessageText() };
+    return { kind: "chat", sessionId, text: lastMessageText() };
   }
 
   const runId = view.latestRun.id;
+  handlers.onRunStarted?.(runId);
   await pump(services, runnerId);
 
   const seenEvents = new Set<string>();
@@ -100,12 +108,12 @@ export async function driveRequest(
 
   for (;;) {
     if (Date.now() > deadline) {
-      return { kind: "run", runId, status: "timeout", text: "The run exceeded its time budget and was left running." };
+      return { kind: "run", sessionId, runId, status: "timeout", text: "The run exceeded its time budget and was left running." };
     }
 
     const runView = await services.runs.get(runId);
     if (!runView) {
-      return { kind: "run", runId, status: "missing", text: "The run record disappeared." };
+      return { kind: "run", sessionId, runId, status: "missing", text: "The run record disappeared." };
     }
 
     // Stream any new events in order.
@@ -135,7 +143,7 @@ export async function driveRequest(
       );
       if (pending.length === 0) {
         // Blocked with no actionable approval (e.g. a denial). Report and stop.
-        return { kind: "run", runId, status, text: await finalText(services, session.session.id) };
+        return { kind: "run", sessionId, runId, status, text: await finalText(services, sessionId) };
       }
       for (const approval of pending) {
         handledApprovals.add(approval.id);
@@ -156,7 +164,7 @@ export async function driveRequest(
     }
 
     if (TERMINAL.has(status)) {
-      return { kind: "run", runId, status, text: await finalText(services, session.session.id) };
+      return { kind: "run", sessionId, runId, status, text: await finalText(services, sessionId) };
     }
 
     await sleep(pollMs);

@@ -8,6 +8,7 @@ import type {
   IntakeDecisionInput,
   IntakeDomainSelection,
   IntakeDomainSelectionInput,
+  ModelCatalogEntry,
   PlanDraft,
   PlanDraftInput,
   PlanStepDraft,
@@ -183,22 +184,122 @@ type ChatCompletionJson = {
       tool_calls?: Array<{ id: string; function: { name: string; arguments: string } }>;
     };
   }>;
+  usage?: { prompt_tokens?: number; completion_tokens?: number };
   error?: { message?: string };
 };
 
+export const AUTO_MODEL_SENTINEL = "auto";
+const MODEL_CATALOG_TTL_MS = 10 * 60 * 1000;
+// How many ranked candidates to keep as the primary + fallback chain in auto
+// mode. Bounded so a bad/expensive tail model is never silently reached.
+const AUTO_MODEL_CHAIN_LENGTH = 6;
+
+async function fetchModelCatalog(apiKey: string, baseUrl: string): Promise<ModelCatalogEntry[]> {
+  const url = `${baseUrl.replace(/\/$/, "")}/models`;
+  const response = await fetch(url, {
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      Accept: "application/json",
+      // Some gateways in front of this API 404 generic Node fetch User-Agents;
+      // postChatCompletion below hits the same wall. Match it here.
+      "User-Agent": "OpenAI/Python/1.56.1 CPython/3.12"
+    }
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "(unreadable)");
+    throw new Error(`Model catalog fetch failed ${response.status}: ${text}`);
+  }
+  const json = (await response.json()) as {
+    data?: Array<{
+      id: string;
+      context_length?: number;
+      concurrency_cost?: number;
+      max_completion_tokens?: number;
+      available_on_current_plan?: boolean;
+      features?: { tool_use?: boolean };
+    }>;
+  };
+  return (json.data ?? []).map((entry) => ({
+    id: entry.id,
+    contextLength: entry.context_length ?? 8192,
+    supportsToolCalling: entry.features?.tool_use ?? false,
+    concurrencyCost: typeof entry.concurrency_cost === "number" ? entry.concurrency_cost : null,
+    availableOnPlan: entry.available_on_current_plan ?? true,
+    maxCompletionTokens: typeof entry.max_completion_tokens === "number" ? entry.max_completion_tokens : null
+  }));
+}
+
+// Featherless hosts ~20K+ community HuggingFace uploads alongside frontier
+// releases, with no curation flag in the API to tell them apart — an
+// unqualified id (e.g. a random "...-Uncensored-Heretic..." finetune) reports
+// the same tool_use/available_on_plan flags as a flagship release. The two
+// signals that actually separate them: the id's namespace is a frontier lab,
+// and Featherless bothered to set an explicit max_completion_tokens (which in
+// practice only shows up on models they've configured as real served
+// endpoints, not auto-listed community uploads).
+const TRUSTED_MODEL_PUBLISHERS = new Set([
+  "Qwen", "deepseek-ai", "moonshotai", "nvidia", "mistralai", "meta-llama",
+  "zai-org", "thudm", "google", "microsoft", "01-ai", "allenai", "openai", "ai21labs"
+]);
+
+function isTrustedPublisher(modelId: string): boolean {
+  return TRUSTED_MODEL_PUBLISHERS.has(modelId.split("/")[0] ?? "");
+}
+
+// Rough parameter count parsed from the model id (e.g. "Qwen3-30B-A3B" -> 30,
+// taking the largest "<N>B" found so MoE "total/active" naming doesn't
+// under-count). Filters out the small distilled/base variants a trusted lab
+// still publishes alongside its flagship releases — those tie on cost and
+// context with the flagship (both defaults) but are meaningfully weaker at
+// the structured-JSON intake/planning decisions this runtime depends on.
+function estimateParamSizeB(modelId: string): number {
+  const matches = [...modelId.matchAll(/(\d+(?:\.\d+)?)[bB](?![a-zA-Z])/g)];
+  return matches.length ? Math.max(...matches.map((m) => parseFloat(m[1]))) : 0;
+}
+const AUTO_MODEL_MIN_SIZE_B = 14;
+
+// Rank the catalog for auto-selection: eligible candidates must support tool
+// calling (this runtime always drives a tool-calling loop) and be available
+// on the account's plan. Among those, prefer the cheaper concurrency_cost —
+// the account's plan-wide concurrency budget is a hard ceiling shared across
+// every in-flight request, so an expensive model risks 429s well before a
+// cheap one does (there's no per-token $ pricing in this API to rank on
+// instead). Context length breaks ties. Three tiers, each a fallback for the
+// last: (1) trusted + well-configured + >=14B, (2) trusted + well-configured
+// of any size, (3) the unfiltered tool-calling pool.
+function rankModels(catalog: ModelCatalogEntry[]): ModelCatalogEntry[] {
+  const eligible = catalog.filter((entry) => entry.supportsToolCalling && entry.availableOnPlan);
+  const byCostThenContext = (a: ModelCatalogEntry, b: ModelCatalogEntry) => {
+    const costA = a.concurrencyCost ?? 99;
+    const costB = b.concurrencyCost ?? 99;
+    if (costA !== costB) return costA - costB;
+    return b.contextLength - a.contextLength;
+  };
+  const curated = eligible.filter((entry) => isTrustedPublisher(entry.id) && entry.maxCompletionTokens != null);
+  const curatedSizedUp = curated.filter((entry) => estimateParamSizeB(entry.id) >= AUTO_MODEL_MIN_SIZE_B);
+  if (curatedSizedUp.length) return curatedSizedUp.sort(byCostThenContext);
+  if (curated.length) return curated.sort(byCostThenContext);
+  return eligible.sort(byCostThenContext);
+}
+
 /**
- * POST a chat completion, trying each model in order. Each model gets a couple of
- * same-model retries on a transient error (the model is often busy for a moment);
- * if it still fails transiently, we fail over to the next model. Non-transient
- * errors fail fast. The winning model's raw JSON is returned.
+ * POST a chat completion, trying each model in order. Each model gets a couple
+ * of same-model retries on a *transient* error (the model is momentarily busy).
+ * A non-transient error (bad request, per-model serving quirk) is not worth
+ * retrying on the same model, but IS worth trying on the next one when
+ * `aggressiveFailover` is set — that's auto mode's "find the next appropriate
+ * model" behavior. In manual mode (aggressiveFailover=false, normally a
+ * one-model list anyway) a non-transient error still fails fast, matching the
+ * user's explicit choice. The winning model's raw JSON is returned.
  */
 async function postChatCompletion(
   apiKey: string,
   baseUrl: string,
   models: string[],
   bodyWithoutModel: Record<string, unknown>,
-  sameModelRetries = 2
-): Promise<ChatCompletionJson> {
+  sameModelRetries = 2,
+  aggressiveFailover = false
+): Promise<{ json: ChatCompletionJson; modelUsed: string }> {
   const url = `${baseUrl.replace(/\/$/, "")}/chat/completions`;
   let lastError: unknown;
   for (let m = 0; m < models.length; m++) {
@@ -223,21 +324,22 @@ async function postChatCompletion(
         if (json.error?.message) {
           throw new Error(`Provider API error: ${json.error.message}`);
         }
-        return json;
+        return { json, modelUsed: models[m] };
       } catch (error) {
         lastError = error;
-        if (!isTransientProviderError(error)) {
+        const transient = isTransientProviderError(error);
+        if (!transient && !aggressiveFailover) {
           throw error;
         }
-        const moreAttemptsOnThisModel = attempt < sameModelRetries;
-        const canFailOver = !moreAttemptsOnThisModel && !isLastModel;
-        if (!moreAttemptsOnThisModel && isLastModel) {
+        const moreAttemptsOnThisModel = transient && attempt < sameModelRetries;
+        if (moreAttemptsOnThisModel) {
+          await new Promise((resolve) => setTimeout(resolve, 400 * (attempt + 1)));
+          continue;
+        }
+        if (isLastModel) {
           throw error;
         }
-        await new Promise((resolve) => setTimeout(resolve, 400 * (attempt + 1)));
-        if (canFailOver) {
-          break; // move to the next model
-        }
+        break; // move to the next model
       }
     }
   }
@@ -249,16 +351,24 @@ async function callApi(
   baseUrl: string,
   models: string[],
   systemPrompt: string,
-  userPrompt: string
+  userPrompt: string,
+  aggressiveFailover = false
 ): Promise<string> {
-  const json = await postChatCompletion(apiKey, baseUrl, models, {
-    messages: [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: userPrompt }
-    ],
-    temperature: 0,
-    max_tokens: 4096
-  });
+  const { json } = await postChatCompletion(
+    apiKey,
+    baseUrl,
+    models,
+    {
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt }
+      ],
+      temperature: 0,
+      max_tokens: 4096
+    },
+    2,
+    aggressiveFailover
+  );
 
   const content = json.choices?.[0]?.message?.content;
   if (!content) {
@@ -274,12 +384,13 @@ async function runStructuredApiCall<T>(
   schema: unknown,
   systemPrompt: string,
   userPrompt: string,
-  maxRetries = 2
+  maxRetries = 2,
+  aggressiveFailover = false
 ): Promise<T> {
   let lastError: unknown;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
-      const content = await callApi(apiKey, baseUrl, models, systemPrompt, userPrompt);
+      const content = await callApi(apiKey, baseUrl, models, systemPrompt, userPrompt, aggressiveFailover);
       const jsonStr = extractJsonFromResponse(content);
       return JSON.parse(jsonStr) as T;
     } catch (error) {
@@ -298,10 +409,42 @@ function normalizePlanSteps(steps: PlanStepDraft[]) {
 
 export function createApiProvider(config: AppConfig): ProviderAdapter {
   const { apiKey, baseUrl, model } = config.provider;
-  // Primary model first, then any configured fallbacks (deduped). Transient
-  // failures on the primary fail over down this list.
-  const models = [...new Set([model, ...(config.provider.fallbackModels ?? [])].filter(Boolean))];
+  const isAutoModel = model === AUTO_MODEL_SENTINEL;
   let governedPromptsPromise: Promise<GovernedProviderPrompts> | null = null;
+  let catalogPromise: Promise<ModelCatalogEntry[]> | null = null;
+  let catalogFetchedAt = 0;
+  let lastResolvedModels: string[] | null = null;
+
+  async function getCatalog(): Promise<ModelCatalogEntry[]> {
+    if (!catalogPromise || Date.now() - catalogFetchedAt > MODEL_CATALOG_TTL_MS) {
+      catalogFetchedAt = Date.now();
+      catalogPromise = fetchModelCatalog(requireApiKey(), baseUrl).catch((error) => {
+        catalogPromise = null;
+        throw error;
+      });
+    }
+    return catalogPromise;
+  }
+
+  // The ordered chain tried for every provider call: primary model first,
+  // then fallbacks. In auto mode this chain is derived from the live model
+  // catalog (ranked by capability), refreshed periodically, instead of a
+  // fixed manual list — and re-derived on every call, so a model that drops
+  // off the plan or loses tool-use support falls out of the chain on its own.
+  async function resolveModels(): Promise<string[]> {
+    if (!isAutoModel) {
+      return [...new Set([model, ...(config.provider.fallbackModels ?? [])].filter(Boolean))];
+    }
+    const catalog = await getCatalog();
+    const ranked = rankModels(catalog).slice(0, AUTO_MODEL_CHAIN_LENGTH).map((entry) => entry.id);
+    if (!ranked.length) {
+      throw new Error(
+        "Auto model selection found no tool-calling-capable models available on this provider account. Set commonsCrew.model explicitly."
+      );
+    }
+    lastResolvedModels = ranked;
+    return ranked;
+  }
 
   async function getGovernedPrompts(): Promise<GovernedProviderPrompts> {
     if (!governedPromptsPromise) {
@@ -325,15 +468,16 @@ export function createApiProvider(config: AppConfig): ProviderAdapter {
   async function getStatus(): Promise<ProviderStatus> {
     const checkedAt = new Date().toISOString();
     const readiness = resolveReadiness();
+    const effectiveModel = isAutoModel ? (lastResolvedModels?.[0] ?? "auto (unresolved)") : model;
     return {
       id: "api-provider",
       displayName: "API Provider",
-      model,
+      model: effectiveModel,
       installed: true,
       authenticated: Boolean(apiKey),
       authMode: "api_key",
       capabilities: {
-        providerIdentity: `${baseUrl} / ${model}`,
+        providerIdentity: `${baseUrl} / ${effectiveModel}`,
         supportsStreaming: false,
         supportsStructuredOutputs: true,
         // The runtime drives an OpenAI-compatible tool-calling loop against this
@@ -373,10 +517,11 @@ export function createApiProvider(config: AppConfig): ProviderAdapter {
       INTAKE_DOMAIN_SELECTION_SCHEMA
     );
     return await runStructuredApiCall<IntakeDomainSelection>(
-      key, baseUrl, models,
+      key, baseUrl, await resolveModels(),
       INTAKE_DOMAIN_SELECTION_SCHEMA,
       system,
-      buildUserPrompt(input)
+      buildUserPrompt(input),
+      2, isAutoModel
     );
   }
 
@@ -384,10 +529,11 @@ export function createApiProvider(config: AppConfig): ProviderAdapter {
     const key = requireApiKey();
     const prompts = await getGovernedPrompts();
     return await runStructuredApiCall<IntakeDecision>(
-      key, baseUrl, models,
+      key, baseUrl, await resolveModels(),
       INTAKE_DECISION_SCHEMA,
       buildSystemPrompt(prompts.intake, INTAKE_DECISION_SCHEMA),
-      buildUserPrompt(input)
+      buildUserPrompt(input),
+      2, isAutoModel
     );
   }
 
@@ -395,10 +541,11 @@ export function createApiProvider(config: AppConfig): ProviderAdapter {
     const key = requireApiKey();
     const prompts = await getGovernedPrompts();
     return await runStructuredApiCall<ChatAnswer>(
-      key, baseUrl, models,
+      key, baseUrl, await resolveModels(),
       CHAT_ANSWER_SCHEMA,
       buildSystemPrompt(prompts.chat, CHAT_ANSWER_SCHEMA),
-      buildUserPrompt(input)
+      buildUserPrompt(input),
+      2, isAutoModel
     );
   }
 
@@ -406,10 +553,11 @@ export function createApiProvider(config: AppConfig): ProviderAdapter {
     const key = requireApiKey();
     const prompts = await getGovernedPrompts();
     const draft = await runStructuredApiCall<PlanDraft>(
-      key, baseUrl, models,
+      key, baseUrl, await resolveModels(),
       PLAN_DRAFT_SCHEMA,
       buildSystemPrompt(prompts.planning, PLAN_DRAFT_SCHEMA),
-      buildUserPrompt(input)
+      buildUserPrompt(input),
+      2, isAutoModel
     );
     return { ...draft, steps: normalizePlanSteps(draft.steps) };
   }
@@ -433,10 +581,11 @@ export function createApiProvider(config: AppConfig): ProviderAdapter {
     };
 
     return await runStructuredApiCall<TaskExecutionResult>(
-      key, baseUrl, models,
+      key, baseUrl, await resolveModels(),
       TASK_EXECUTION_SCHEMA,
       buildSystemPrompt(executionSection, TASK_EXECUTION_SCHEMA),
-      buildUserPrompt(enrichedInput)
+      buildUserPrompt(enrichedInput),
+      2, isAutoModel
     );
   }
 
@@ -444,10 +593,11 @@ export function createApiProvider(config: AppConfig): ProviderAdapter {
     const key = requireApiKey();
     const prompts = await getGovernedPrompts();
     return await runStructuredApiCall<RunResultSynthesisResult>(
-      key, baseUrl, models,
+      key, baseUrl, await resolveModels(),
       RUN_RESULT_SYNTHESIS_SCHEMA,
       buildSystemPrompt(prompts.finalResult, RUN_RESULT_SYNTHESIS_SCHEMA),
-      buildUserPrompt(input)
+      buildUserPrompt(input),
+      2, isAutoModel
     );
   }
 
@@ -479,19 +629,33 @@ export function createApiProvider(config: AppConfig): ProviderAdapter {
       function: { name: t.name, description: t.description, parameters: t.parameters }
     }));
 
-    const json = await postChatCompletion(key, baseUrl, models, {
-      messages,
-      tools: tools.length ? tools : undefined,
-      temperature: 0,
-      max_tokens: 4096
-    });
+    const { json, modelUsed } = await postChatCompletion(
+      key,
+      baseUrl,
+      await resolveModels(),
+      {
+        messages,
+        tools: tools.length ? tools : undefined,
+        temperature: 0,
+        max_tokens: 4096
+      },
+      2,
+      isAutoModel
+    );
     const message = json.choices?.[0]?.message ?? {};
     return {
       content: typeof message.content === "string" ? message.content : null,
       toolCalls: Array.isArray(message.tool_calls)
         ? message.tool_calls.map((tc) => ({ id: tc.id, name: tc.function.name, arguments: tc.function.arguments }))
-        : []
+        : [],
+      usage: json.usage
+        ? { model: modelUsed, promptTokens: json.usage.prompt_tokens ?? 0, completionTokens: json.usage.completion_tokens ?? 0 }
+        : undefined
     };
+  }
+
+  async function listModels(): Promise<ModelCatalogEntry[]> {
+    return await getCatalog();
   }
 
   return {
@@ -500,6 +664,7 @@ export function createApiProvider(config: AppConfig): ProviderAdapter {
     decideIntake,
     answerChat,
     createPlan,
+    listModels,
     executeTask,
     proposeToolCalls,
     synthesizeRunResult

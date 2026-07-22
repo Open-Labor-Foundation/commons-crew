@@ -195,6 +195,38 @@ const INTAKE_NO_DOMAIN_SAMPLE = 24;
 const activeRunJobs = new Set<Promise<void>>();
 const terminalRunStatuses = new Set<RunRecord["status"]>(["completed", "failed", "cancelled"]);
 
+/** Counting semaphore bounding how many runs execute at once (config.runtime.maxConcurrentRuns). */
+class RunConcurrencyLimiter {
+  private active = 0;
+  private queue: Array<() => void> = [];
+
+  constructor(private max: number) {}
+
+  setMax(max: number): void {
+    this.max = max;
+    this.drain();
+  }
+
+  private drain(): void {
+    while (this.active < this.max && this.queue.length > 0) {
+      this.active++;
+      this.queue.shift()!();
+    }
+  }
+
+  acquire(): Promise<() => void> {
+    return new Promise((resolve) => {
+      this.queue.push(() => resolve(() => this.release()));
+      this.drain();
+    });
+  }
+
+  private release(): void {
+    this.active = Math.max(0, this.active - 1);
+    this.drain();
+  }
+}
+
 function getDefaultBudgetProfile(): BudgetProfile {
   return {
     id: AUTONOMOUS_BUDGET_POLICY.profile,
@@ -1180,7 +1212,8 @@ function buildRunResultSynthesisInput(
         assignedAgentName: assignedEntry?.name ?? null,
         assignedAgentDomain: assignedEntry?.manifest.identity.boundary.domain ?? null,
         summary: task.resultSummary ?? `Completed task: ${task.name}`,
-        detail: task.resultDetail ?? null
+        detail: task.resultDetail ?? null,
+        mutatingActionsCount: task.resultMutatingActionsCount ?? 0
       };
     });
 
@@ -1356,37 +1389,43 @@ function createEvaluationTaskExecutionResult(input: TaskExecutionInput): TaskExe
     if (input.materializedSpecialist) {
       return {
         summary: `${input.specialist.name} executed from materialized specialist bundle ${input.materializedSpecialist.materializationId}.`,
-        detail: `Loaded the governed bundle from ${input.materializedSpecialist.generatedPath} and applied the declared ${input.materializedSpecialist.runtimeBundle.identity.boundary.domain} boundary.`
+        detail: `Loaded the governed bundle from ${input.materializedSpecialist.generatedPath} and applied the declared ${input.materializedSpecialist.runtimeBundle.identity.boundary.domain} boundary.`,
+        mutatingActionsCount: 1
       };
     }
     if (input.task.name === "Execute planned work") {
       return {
         summary: `${input.specialist.name} led planning and integration, collected the specialist handoffs, and returned the integrated result to PA.`,
-        detail: `Completed the lead ${input.specialist.domain} workstream for ${input.run.summary}.`
+        detail: `Completed the lead ${input.specialist.domain} workstream for ${input.run.summary}.`,
+        mutatingActionsCount: 1
       };
     }
     if (input.task.name.startsWith("Specialist contribution:")) {
       return {
         summary: `${input.specialist.name} completed the ${input.specialist.domain} workstream and handed back deliverables, dependencies, and follow-up constraints.`,
-        detail: `Returned a governed specialist handoff for ${input.task.description}.`
+        detail: `Returned a governed specialist handoff for ${input.task.description}.`,
+        mutatingActionsCount: 1
       };
     }
     return {
       summary: `${input.specialist.name} advanced the ${input.specialist.domain} workstream for this run.`,
-      detail: input.task.description
+      detail: input.task.description,
+      mutatingActionsCount: 1
     };
   }
 
   if (input.task.taskKind === "cleanup") {
     return {
       summary: "PA packaged the final completion summary.",
-      detail: "Collected the completed task handoffs into a final PA-facing update."
+      detail: "Collected the completed task handoffs into a final PA-facing update.",
+      mutatingActionsCount: 0
     };
   }
 
   return {
     summary: `PA completed task: ${input.task.name}.`,
-    detail: input.task.description
+    detail: input.task.description,
+    mutatingActionsCount: 0
   };
 }
 
@@ -2052,6 +2091,7 @@ export async function createAppServices(
   await fs.mkdir(config.paths.artifactsRoot, { recursive: true });
   await fs.mkdir(config.paths.backupsRoot, { recursive: true });
   let shuttingDown = false;
+  const runConcurrencyLimiter = new RunConcurrencyLimiter(config.runtime.maxConcurrentRuns);
   const provider = options.provider ?? createApiProvider(config);
   const actionExecutor = options.actionExecutor ?? createDefaultActionToolExecutor(config);
   const logger = options.logger;
@@ -2276,7 +2316,17 @@ export async function createAppServices(
   }
 
   function startRunExecution(runId: string, jobId: string) {
-    const job = executeRun(runId, jobId);
+    // Gated by runConcurrencyLimiter: the runnerJob is already "running" (set by
+    // runner.start before this is called), but the actual executeRun work waits
+    // its turn here if config.runtime.maxConcurrentRuns is already saturated.
+    const job = (async () => {
+      const release = await runConcurrencyLimiter.acquire();
+      try {
+        await executeRun(runId, jobId);
+      } finally {
+        release();
+      }
+    })();
     trackRunJob(job.catch((error) => {
       if (!shuttingDown) {
         console.error("run execution failed", error);
@@ -2904,7 +2954,8 @@ export async function createAppServices(
           ? {
               ...task,
               resultSummary: summary,
-              resultDetail: detail
+              resultDetail: detail,
+              resultMutatingActionsCount: result.mutatingActionsCount
             }
           : task
       )
@@ -3325,13 +3376,64 @@ export async function createAppServices(
     const messages: ProviderToolLoopMessage[] = [{ role: "user", content: userContent }];
     const actionsTaken: string[] = [];
     let finalText: string | null = null;
-    const maxSteps = 24;
+    let mutatingActionsCount = 0;
+    const maxSteps = config.runtime.maxToolSteps ?? 24;
+    const MUTATING_TOOLS = new Set(["write_file", "edit_file", "run_command"]);
+    // "Execute planned work" and delegated "Specialist contribution: ..." tasks
+    // are where the actual implementation is supposed to happen — unlike
+    // "Analyze request" or "Summarize outcome", which are legitimately
+    // read-only. Note both of the former are tagged taskKind "operational" in
+    // the current task graph (a pre-existing overload of that label with the
+    // literal read-only "Analyze request" step), so this gates on task name,
+    // matching what rankExecutionTask already distinguishes. A task cleared
+    // for side effects that stops without ever mutating anything is exactly
+    // the shallow "inspected once, declared done" failure mode — keep forcing
+    // continuation instead of accepting it on the first vague promise (a
+    // single nudge was verified to be trivially defeated by another
+    // non-committal "I'll do it next" reply). Prose telling the model not to
+    // do this (see catalog/platform-assistant/spec.yaml) is necessary but not
+    // sufficient on its own; this is the hard gate. Capped well under maxSteps
+    // so a genuinely blocked task still terminates and reports zero progress
+    // honestly rather than burning the whole step budget on nudges.
+    const mustShowMutatingProgress =
+      allowSideEffects && (task.name === "Execute planned work" || task.name.startsWith("Specialist contribution:"));
+    const MAX_EVIDENCE_NUDGES = 5;
+    let evidenceNudges = 0;
 
     for (let step = 0; step < maxSteps; step++) {
       const response = await provider.proposeToolCalls({ systemPrompt, messages, tools });
+      if (response.usage) {
+        await appendEvent(run.id, "task.usage", { taskId: task.id, step, ...response.usage }, task.id);
+      }
       if (!response.toolCalls.length) {
+        if (mustShowMutatingProgress && mutatingActionsCount === 0 && evidenceNudges < MAX_EVIDENCE_NUDGES) {
+          evidenceNudges++;
+          await appendEvent(
+            run.id,
+            "task.reasoning",
+            { taskId: task.id, step, text: `[evidence gate ${evidenceNudges}/${MAX_EVIDENCE_NUDGES}] "${response.content?.trim() ?? ""}" was rejected as a completion: this task requires real progress (a write_file/edit_file/run_command that succeeds) and none has happened yet.` },
+            task.id
+          );
+          messages.push({ role: "assistant", content: response.content, toolCalls: [] });
+          messages.push({
+            role: "user",
+            content:
+              "That is a plan or intention, not a completed change, and you have not made any file or command changes yet. This task requires real implementation progress. " +
+              "Call write_file, edit_file, or run_command RIGHT NOW in this reply — do not describe what you are about to do. " +
+              "If a concrete tool or filesystem error is blocking every attempt, state that exact error instead. " +
+              "Do not reply with a completion summary until you have done one of those two things."
+          });
+          continue;
+        }
         finalText = response.content;
         break;
+      }
+
+      // Surface the model's reasoning for this step (e.g. a reasoning model's
+      // <think> block, or its plain rationale) before the tool calls it leads
+      // to, so a surface's chat view can show more than a bare tool-call line.
+      if (response.content && response.content.trim()) {
+        await appendEvent(run.id, "task.reasoning", { taskId: task.id, step, text: response.content.trim() }, task.id);
       }
 
       messages.push({ role: "assistant", content: response.content, toolCalls: response.toolCalls });
@@ -3341,6 +3443,9 @@ export async function createAppServices(
         const idempotencyKey = `${task.id}:${step}:${call.id}`;
         const result = await runGovernedToolCall(run, task, allowSideEffects, call.name, args, idempotencyKey);
         actionsTaken.push(`${call.name} ${result.targetRef} -> ${result.outcome}`);
+        if (result.ok && MUTATING_TOOLS.has(call.name)) {
+          mutatingActionsCount++;
+        }
         messages.push({
           role: "tool",
           toolCallId: call.id,
@@ -3360,7 +3465,37 @@ export async function createAppServices(
       finalText?.trim() ||
       (actionsTaken.length ? `Completed the task via ${actionsTaken.length} governed tool action(s).` : "Task completed with no changes required.");
     const detail = actionsTaken.length ? actionsTaken.join("\n") : finalText?.trim() ? null : "No tools were used.";
-    return { summary, detail };
+    return { summary, detail, mutatingActionsCount };
+  }
+
+  // Hard gate on the final narrative, not just prose asking the model to be
+  // honest (that alone was verified insufficient — a model will still write a
+  // confident "successfully created and deployed" summary from thin/empty
+  // evidence). If this was an execution-track run (it produced "Execute
+  // planned work" / delegated specialist tasks) and not one governed tool call
+  // actually mutated anything, skip the LLM narrative entirely and report that
+  // deterministically. There is nothing for a model to embellish if it never
+  // gets asked.
+  async function synthesizeGroundedRunResult(input: RunResultSynthesisInput): Promise<RunResultSynthesisResult> {
+    const hasImplementationTasks = input.completedTasks.some(
+      (task) => task.name === "Execute planned work" || task.name.startsWith("Specialist contribution:")
+    );
+    const totalMutations = input.completedTasks.reduce((sum, task) => sum + task.mutatingActionsCount, 0);
+    if (hasImplementationTasks && totalMutations === 0) {
+      const attempted = input.completedTasks
+        .filter((task) => task.name === "Execute planned work" || task.name.startsWith("Specialist contribution:"))
+        .map((task) => `- ${task.assignedAgentName ?? task.name}: ${task.summary}`)
+        .join("\n");
+      const content = [
+        "No implementation changes were made — every step in this run inspected the workspace or reasoned about the task without writing a file or running a command that succeeded.",
+        attempted ? `What was attempted:\n${attempted}` : "",
+        "Nothing was built or deployed. Retrying, narrowing the task, or checking the workspace/approval settings is likely needed."
+      ]
+        .filter(Boolean)
+        .join("\n\n");
+      return { summary: "No implementation progress was made in this run.", content };
+    }
+    return await provider.synthesizeRunResult(input);
   }
 
   async function executeRun(runId: string, jobId: string) {
@@ -3404,7 +3539,7 @@ export async function createAppServices(
       if (!synthesisInput) {
         throw new Error(`Unable to synthesize final result for missing run ${runId}.`);
       }
-      const synthesizedResult = await provider.synthesizeRunResult(synthesisInput);
+      const synthesizedResult = await synthesizeGroundedRunResult(synthesisInput);
       await store.write((current) => ({
         ...current,
         runs: current.runs.map((entry) =>
@@ -4713,6 +4848,32 @@ export async function createAppServices(
       return await getSessionView(sessionId);
     },
 
+    // Session history, newest first. Used by surfaces that show a chat list.
+    // Archived sessions are excluded by default — deleteSession archives rather
+    // than destroys, so governance evidence tied to a session's runs/approvals
+    // is never removed, only hidden from the visible history list.
+    async listSessions(surface?: Surface, options: { includeArchived?: boolean } = {}): Promise<SessionRecord[]> {
+      const state = await store.read();
+      return [...state.sessions]
+        .filter((entry) => (surface ? entry.surface === surface : true))
+        .filter((entry) => options.includeArchived || entry.status !== "archived")
+        .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+    },
+
+    async archiveSession(sessionId: string): Promise<boolean> {
+      const state = await store.read();
+      if (!state.sessions.some((entry) => entry.id === sessionId)) {
+        return false;
+      }
+      await store.write((current) => ({
+        ...current,
+        sessions: current.sessions.map((entry) =>
+          entry.id === sessionId ? { ...entry, status: "archived", updatedAt: now() } : entry
+        )
+      }));
+      return true;
+    },
+
     async postMessage(sessionId: string, content: string, options: { traceId?: string } = {}) {
       const state = await store.read();
       const session = state.sessions.find((entry) => entry.id === sessionId);
@@ -4814,7 +4975,9 @@ export async function createAppServices(
         const intake = await decideIntake(session, normalizedContent);
         intakeDecision = intake.decision;
         specialistSelection = intake.selection;
-      } catch {
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error("[commons-crew] decideIntake failed:", err);
         const warningMessage: MessageRecord = {
           id: randomUUID(),
           sessionId,

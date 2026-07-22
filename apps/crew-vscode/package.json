@@ -1,8 +1,8 @@
 {
   "name": "commons-crew-vscode",
   "displayName": "commons-crew",
-  "description": "Autonomous coding with governed specialists materialized from the labor-commons catalog.",
-  "version": "0.1.0",
+  "description": "The commons-crew runtime as a first-class panel: chat with a team of governed specialists materialized from the labor-commons catalog, working autonomously in your workspace.",
+  "version": "0.2.0",
   "publisher": "open-labor-foundation",
   "private": true,
   "license": "AGPL-3.0-or-later",
@@ -17,15 +17,63 @@
   "activationEvents": [],
   "main": "./dist/extension.js",
   "contributes": {
-    "chatParticipants": [
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "commonsCrew",
+          "title": "commons-crew",
+          "icon": "resources/commons-crew.svg"
+        }
+      ]
+    },
+    "views": {
+      "commonsCrew": [
+        {
+          "id": "commonsCrew.main",
+          "name": "commons-crew",
+          "type": "webview"
+        }
+      ]
+    },
+    "commands": [
       {
-        "id": "commons-crew.chat",
-        "name": "commons-crew",
-        "fullName": "commons-crew",
-        "description": "Materializes a governed software specialist from labor-commons and works the task autonomously in your workspace.",
-        "isSticky": true
+        "command": "commonsCrew.newChat",
+        "title": "New Chat",
+        "category": "commons-crew",
+        "icon": "$(add)"
+      },
+      {
+        "command": "commonsCrew.refreshHistory",
+        "title": "Refresh History",
+        "category": "commons-crew",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "commonsCrew.openSettings",
+        "title": "Open Settings",
+        "category": "commons-crew",
+        "icon": "$(gear)"
       }
     ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "commonsCrew.newChat",
+          "when": "view == commonsCrew.main",
+          "group": "navigation@1"
+        },
+        {
+          "command": "commonsCrew.refreshHistory",
+          "when": "view == commonsCrew.main",
+          "group": "navigation@2"
+        },
+        {
+          "command": "commonsCrew.openSettings",
+          "when": "view == commonsCrew.main",
+          "group": "navigation@3"
+        }
+      ]
+    },
     "configuration": {
       "title": "commons-crew",
       "properties": {
@@ -41,8 +89,14 @@
         },
         "commonsCrew.model": {
           "type": "string",
-          "default": "Qwen/Qwen3-32B",
-          "description": "Model id. Must support tool calling (e.g. Qwen3 family, Kimi-K2)."
+          "default": "auto",
+          "markdownDescription": "Model id, or `auto` (default) to pick the best tool-calling model from your provider's live catalog and cascade to the next-best on failure. Must support tool calling if set explicitly (e.g. Qwen3 family, Kimi-K2)."
+        },
+        "commonsCrew.fallbackModels": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "markdownDescription": "Ordered fallback models tried when the primary model is transiently unavailable (busy / overloaded / 429 / 5xx). Ignored when commonsCrew.model is `auto` — the fallback chain is derived from the catalog instead. Example: `moonshotai/Kimi-K2-Instruct`, `Qwen/Qwen3-235B-A22B`."
         },
         "commonsCrew.catalogRef": {
           "type": "string",
@@ -58,6 +112,13 @@
           "type": "number",
           "default": 40,
           "description": "Maximum autonomous tool-loop iterations per task before stopping."
+        },
+        "commonsCrew.maxConcurrentLanes": {
+          "type": "number",
+          "default": 4,
+          "minimum": 1,
+          "maximum": 8,
+          "markdownDescription": "Maximum number of runs this extension executes at once. A safety valve on your own machine's/provider's load — not a platform limit."
         }
       }
     }

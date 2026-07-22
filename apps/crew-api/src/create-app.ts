@@ -135,37 +135,43 @@ function createTestTaskExecutionResult(input: TaskExecutionInput): TaskExecution
     if (input.materializedSpecialist) {
       return {
         summary: `${input.specialist.name} executed from materialized specialist bundle ${input.materializedSpecialist.materializationId}.`,
-        detail: `Loaded the governed bundle from ${input.materializedSpecialist.generatedPath} and applied the declared ${input.materializedSpecialist.runtimeBundle.identity.boundary.domain} boundary.`
+        detail: `Loaded the governed bundle from ${input.materializedSpecialist.generatedPath} and applied the declared ${input.materializedSpecialist.runtimeBundle.identity.boundary.domain} boundary.`,
+        mutatingActionsCount: 1
       };
     }
     if (input.task.name === "Execute planned work") {
       return {
         summary: `${input.specialist.name} led planning and integration, collected the specialist handoffs, and returned the integrated result to PA.`,
-        detail: `Completed the lead ${input.specialist.domain} workstream.`
+        detail: `Completed the lead ${input.specialist.domain} workstream.`,
+        mutatingActionsCount: 1
       };
     }
     if (input.task.name.startsWith("Specialist contribution:")) {
       return {
         summary: `${input.specialist.name} completed the ${input.specialist.domain} workstream and handed back deliverables, dependencies, and follow-up constraints.`,
-        detail: `Delivered the specialist handoff for ${input.task.description}.`
+        detail: `Delivered the specialist handoff for ${input.task.description}.`,
+        mutatingActionsCount: 1
       };
     }
     return {
       summary: `${input.specialist.name} advanced the ${input.specialist.domain} workstream for this run.`,
-      detail: input.task.description
+      detail: input.task.description,
+      mutatingActionsCount: 1
     };
   }
 
   if (input.task.taskKind === "cleanup") {
     return {
       summary: "PA packaged the final completion summary.",
-      detail: "Collected the task handoffs into a final PA result."
+      detail: "Collected the task handoffs into a final PA result.",
+      mutatingActionsCount: 0
     };
   }
 
   return {
     summary: `PA completed task: ${input.task.name}.`,
-    detail: input.task.description
+    detail: input.task.description,
+    mutatingActionsCount: 0
   };
 }
 

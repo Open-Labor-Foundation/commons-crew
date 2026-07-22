@@ -40,6 +40,43 @@ environment variable and run a compose file by hand. A no-terminal
 deployment (desktop and mobile apps) is a near-term commitment, not built
 yet.
 
+## Deploy on Featherless
+
+commons-crew can run as a user-deployed agent on
+[Featherless.ai](https://featherless.ai)'s agent platform. The root
+[`Dockerfile`](Dockerfile) is self-contained — no Postgres, no external
+database, catalog auto-synced from labor-commons at boot.
+
+**How it works:**
+
+1. Featherless mirrors this repo from GitHub to its internal GitLab
+2. Featherless builds the Docker image from the root `Dockerfile` and pushes
+   to `docker.io/featherlessai/commons-crew:<tag>`
+3. Featherless pulls the image, injects the user's API key as
+   `FEATHERLESS_API_KEY`, and the container maps that to
+   `PA_PROVIDER_API_KEY` at startup
+4. Featherless proxies requests to port 8080 and health-checks `/health`
+
+**What the user needs to do:**
+
+- Push this repo (with the root `Dockerfile`) to the `main` branch on
+  [GitHub](https://github.com/Open-Labor-Foundation/commons-crew)
+- Trigger a re-sync on the Featherless agent platform at
+  `featherless.ai/account/agents/apps/commons-crew`
+- Featherless mirrors, builds, and deploys automatically
+
+**Configuration:**
+
+The default model is `Qwen/Qwen3-32B` on Featherless's API. To override,
+set `PA_PROVIDER_MODEL` in the Featherless build environment.
+
+**Known limitation — ephemeral state:**
+
+Featherless containers are ephemeral. Conversation history is lost on
+container restart. The agent itself works fine — the specialist catalog
+re-syncs from labor-commons git at boot. If Featherless adds persistent
+volumes in the future, mount at `/app/.data` to preserve state.
+
 ## Part of the Open Labor Foundation
 
 [labor-commons](https://github.com/Open-Labor-Foundation/labor-commons) —

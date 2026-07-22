@@ -11,6 +11,7 @@
   "workspaces": [
     "apps/crew-api",
     "apps/crew-runner",
+    "apps/crew-vscode",
     "packages/*"
   ],
   "scripts": {
@@ -29,9 +30,12 @@
     "docker:down": "docker compose -f infra/docker/compose.yaml down -v"
   },
   "devDependencies": {
+    "@types/jest": "^30.0.0",
     "@types/node": "^24.6.0",
     "@types/pg": "^8.15.6",
+    "jest": "^30.4.2",
     "pg-mem": "^3.0.14",
+    "ts-jest": "^29.4.11",
     "tsx": "^4.20.6",
     "typescript": "^5.9.3",
     "vitest": "^3.2.4"
