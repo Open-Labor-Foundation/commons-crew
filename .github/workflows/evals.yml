@@ -1,0 +1,26 @@
+# Target path in the repo: .github/workflows/evals.yml
+#
+# Make this a REQUIRED status check in branch protection on `main`
+# (Settings -> Branches -> Require status checks to pass). Only then does a
+# failing golden actually block a merge — the workflow alone just reports.
+
+name: governance-goldens
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  goldens:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci
+      # tsx runs the TypeScript directly with no build step. Add it once:
+      #   npm i -D tsx
+      - name: Run governance goldens
+        run: npx tsx evals/run.ts
