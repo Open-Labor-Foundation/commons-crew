@@ -20,6 +20,7 @@
 // hardcoded here for that reason, not inferred.
 
 import type { Golden } from "./schema";
+import { AUTOPILOT_MAX_AUTO_APPROVED_DELEGATIONS_PER_ORG } from "@commons-crew/core";
 
 export type AutonomyTier = "advisor" | "orchestrator" | "autopilot";
 
@@ -133,7 +134,7 @@ export const delegationGateGoldens: Golden<
       tier: "autopilot",
       parentLayer: "department",
       staticRequiresApproval: true,
-      existingDelegatedRuns: 20,
+      existingDelegatedRuns: AUTOPILOT_MAX_AUTO_APPROVED_DELEGATIONS_PER_ORG,
     },
     expected: { requiresApproval: true },
   },
@@ -147,7 +148,7 @@ export const delegationGateGoldens: Golden<
       tier: "orchestrator",
       parentLayer: "department",
       staticRequiresApproval: true,
-      existingDelegatedRuns: 20,
+      existingDelegatedRuns: AUTOPILOT_MAX_AUTO_APPROVED_DELEGATIONS_PER_ORG,
     },
     expected: { requiresApproval: true },
   },
